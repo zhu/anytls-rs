@@ -86,37 +86,42 @@ impl SessionPool {
         self.next_seq.fetch_add(1, Ordering::Relaxed)
     }
 
-    /// Get an idle session (returns the most recent one, i.e., largest seq)
+    /// Get an idle session for reuse (the most recent live one, largest seq).
+    ///
+    /// The session is **left in the pool** (peek-and-touch, not remove): AnyTLS
+    /// multiplexes many streams over one session, so the same session stays
+    /// available for concurrent and subsequent streams and is only retired by
+    /// the cleanup task once it is genuinely idle. Removing-without-returning
+    /// here was the FD-leak root cause (issue meow-rs#201): a reused session
+    /// became orphaned — held alive forever by its own heartbeat task — and
+    /// never freed its socket, exhausting file descriptors under churn.
+    ///
+    /// Closed sessions encountered along the way are pruned.
     pub async fn get_idle_session(&self) -> Option<Arc<Session>> {
-        loop {
-            let mut sessions = self.idle_sessions.write().await;
+        let mut sessions = self.idle_sessions.write().await;
 
-            let seq = match sessions.last_key_value() {
-                Some((seq, _)) => *seq,
-                None => {
-                    tracing::debug!("[SessionPool] No idle sessions available");
-                    return None;
-                }
-            };
-
-            if let Some(pooled) = sessions.remove(&seq) {
-                let idle_secs = pooled.idle_since.elapsed().as_secs_f64();
-                if pooled.session.is_closed() {
-                    tracing::debug!(
-                        "[SessionPool] Skipping closed session (seq={}, idle_for={:.1}s)",
-                        pooled.seq,
-                        idle_secs
-                    );
-                    continue;
-                }
-                tracing::debug!(
-                    "[SessionPool] Reusing idle session (seq={}, idle_for={:.1}s)",
-                    pooled.seq,
-                    idle_secs
-                );
-                return Some(pooled.session);
+        let mut closed = Vec::new();
+        let mut chosen = None;
+        // Iterate newest-first; reuse the first live session.
+        for (seq, pooled) in sessions.iter_mut().rev() {
+            if pooled.session.is_closed() {
+                closed.push(*seq);
+                continue;
             }
+            pooled.idle_since = Instant::now();
+            tracing::debug!("[SessionPool] Reusing idle session (seq={})", pooled.seq);
+            chosen = Some(Arc::clone(&pooled.session));
+            break;
         }
+
+        for seq in closed {
+            sessions.remove(&seq);
+        }
+
+        if chosen.is_none() {
+            tracing::debug!("[SessionPool] No idle sessions available");
+        }
+        chosen
     }
 
     /// Add a session to the idle pool
@@ -174,6 +179,14 @@ impl SessionPool {
 
             if pooled.session.is_closed() {
                 to_remove.push(*seq);
+                continue;
+            }
+
+            // Never retire a session that is still carrying streams — pooled
+            // sessions are reused in place (see `get_idle_session`), so an
+            // active long-lived stream can outlive the idle timeout.
+            if pooled.session.has_active_streams().await {
+                active_count += 1;
                 continue;
             }
 
@@ -263,6 +276,12 @@ impl SessionPool {
 
                     if pooled.session.is_closed() {
                         to_remove.push(*seq);
+                        continue;
+                    }
+
+                    // Don't retire a session still carrying streams.
+                    if pooled.session.has_active_streams().await {
+                        active_count += 1;
                         continue;
                     }
 

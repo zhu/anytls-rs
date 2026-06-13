@@ -509,12 +509,22 @@ async fn proxy_tcp_connection_data_forwarding(
         );
     });
 
-    // 等待两个任务完成
+    // Tear down as soon as EITHER direction finishes. Previously this waited
+    // for BOTH tasks (`join!`): when the client closed its stream (FIN), task1
+    // hit stream-EOF and exited, but task2 stayed blocked reading the still-open
+    // target, so `join!` never returned and the outbound TCP socket (its fd)
+    // leaked for the life of the process — one per proxied stream. Cancelling
+    // the surviving half drops its socket end and closes the target connection.
     tracing::debug!(
-        "[Proxy] Waiting for tasks to complete for stream {}",
+        "[Proxy] Waiting for either task to complete for stream {}",
         stream_id
     );
-    let _ = tokio::join!(task1, task2);
+    let mut task1 = task1;
+    let mut task2 = task2;
+    tokio::select! {
+        _ = &mut task1 => { task2.abort(); }
+        _ = &mut task2 => { task1.abort(); }
+    }
     let outbound_bytes = bytes_to_outbound.load(Ordering::Relaxed);
     let client_bytes = bytes_to_client.load(Ordering::Relaxed);
 
