@@ -31,6 +31,10 @@ pub struct Stream {
     // ===== 状态管理 =====
     is_closed: Arc<AtomicBool>,
     close_error: Arc<tokio::sync::Mutex<Option<AnyTlsError>>>,
+
+    // Guards the one-shot stream-close sentinel so a FIN is emitted at most
+    // once regardless of how many times `close()`/`poll_shutdown` fire.
+    fin_sent: Arc<AtomicBool>,
 }
 
 impl Stream {
@@ -57,6 +61,7 @@ impl Stream {
             synack_tx: Arc::new(tokio::sync::Mutex::new(Some(synack_tx))),
             is_closed: Arc::new(AtomicBool::new(false)),
             close_error: Arc::new(tokio::sync::Mutex::new(None)),
+            fin_sent: Arc::new(AtomicBool::new(false)),
         };
 
         (stream, synack_rx)
@@ -111,6 +116,30 @@ impl Stream {
     /// Check if stream is closed
     pub fn is_closed(&self) -> bool {
         self.is_closed.load(Ordering::Relaxed)
+    }
+
+    /// Gracefully close this client stream.
+    ///
+    /// Signals the owning session (via the writer channel's empty-`Bytes`
+    /// sentinel — see `Session::process_stream_data`) to emit a `Fin` frame
+    /// for this stream id and evict it from the session's stream maps. Without
+    /// this, client streams were never removed from `Session::streams` /
+    /// `Session::stream_receive_tx` and never FIN-acked to the peer, so both
+    /// maps grew unbounded for the life of the (long-lived, pooled) session.
+    ///
+    /// Lock-free and idempotent, so it is safe to call from `poll_shutdown`
+    /// or a `Drop` impl on a wrapper type.
+    pub fn close(&self) {
+        self.is_closed.store(true, Ordering::Relaxed);
+        if self
+            .fin_sent
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
+            .is_ok()
+        {
+            // Best-effort: if the session writer task is already gone the
+            // stream is being torn down anyway, so a send error is harmless.
+            let _ = self.writer_tx.send((self.id, Bytes::new()));
+        }
     }
 
     /// Get a reference to the reader (for direct access in handlers)
@@ -237,8 +266,8 @@ impl AsyncWrite for Stream {
     }
 
     fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        // Mark as closed
-        self.is_closed.store(true, Ordering::Relaxed);
+        // Emit a FIN and evict this stream from the session maps.
+        self.close();
         Poll::Ready(Ok(()))
     }
 }

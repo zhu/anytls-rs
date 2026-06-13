@@ -209,6 +209,16 @@ impl Session {
         self.is_closed.load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// Whether the session currently carries any open streams.
+    ///
+    /// Used by the session pool's cleanup task to avoid closing a pooled
+    /// session that is still serving traffic (e.g. a long-running download).
+    /// Accurate now that client streams are evicted on close (`Stream::close`
+    /// emits a FIN and removes the maps).
+    pub async fn has_active_streams(&self) -> bool {
+        !self.streams.read().await.is_empty()
+    }
+
     /// Close the session
     pub async fn close(&self) -> Result<()> {
         let already_closed = self
@@ -1132,6 +1142,11 @@ impl Session {
                     tracing::error!("[Session] recv_loop task error: {}", e);
                 }
             }
+            // The read side is gone: mark the session closed so the pool stops
+            // handing it out, its writer half is shut down, and the heartbeat
+            // task exits — otherwise a server-closed session lingered in the
+            // pool (heartbeat keeping its socket open) and leaked its fd.
+            let _ = session.close().await;
         });
 
         // Start stream data processing in background
@@ -1279,6 +1294,24 @@ impl Session {
                             iteration
                         );
                         break;
+                    }
+                    if data.is_empty() {
+                        // Stream-close sentinel (see `Stream::close`): emit a
+                        // FIN for this stream so the peer evicts its slot, then
+                        // drop our own stream maps. This keeps `streams` /
+                        // `stream_receive_tx` bounded over a long-lived session
+                        // instead of growing one entry per opened stream.
+                        tracing::debug!(
+                            session_id = session_id,
+                            "[Session] process_stream_data: closing stream {} (FIN)",
+                            stream_id
+                        );
+                        let _ = self
+                            .write_control_frame(Frame::control(Command::Fin, stream_id))
+                            .await;
+                        self.streams.write().await.remove(&stream_id);
+                        self.stream_receive_tx.write().await.remove(&stream_id);
+                        continue;
                     }
                     let data_len = data.len();
                     tracing::debug!(
