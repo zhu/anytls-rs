@@ -23,7 +23,7 @@ pub struct Stream {
     reader: Arc<tokio::sync::Mutex<StreamReader>>,
 
     // ===== 写入部分：直接使用 channel，无需锁 =====
-    writer_tx: mpsc::UnboundedSender<(u32, Bytes)>,
+    writer_tx: mpsc::Sender<(u32, Bytes)>,
 
     // ===== SYNACK 通知 (用于超时检测) =====
     synack_tx: Arc<tokio::sync::Mutex<Option<oneshot::Sender<Result<()>>>>>,
@@ -50,7 +50,7 @@ impl Stream {
     pub fn new(
         id: u32,
         reader: StreamReader,
-        writer_tx: mpsc::UnboundedSender<(u32, Bytes)>,
+        writer_tx: mpsc::Sender<(u32, Bytes)>,
     ) -> (Self, oneshot::Receiver<Result<()>>) {
         let (synack_tx, synack_rx) = oneshot::channel();
 
@@ -134,11 +134,24 @@ impl Stream {
         if self
             .fin_sent
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
-            .is_ok()
+            .is_err()
         {
-            // Best-effort: if the session writer task is already gone the
-            // stream is being torn down anyway, so a send error is harmless.
-            let _ = self.writer_tx.send((self.id, Bytes::new()));
+            return;
+        }
+
+        let fin = (self.id, Bytes::new());
+        match self.writer_tx.try_send(fin) {
+            Ok(()) | Err(mpsc::error::TrySendError::Closed(_)) => {}
+            Err(mpsc::error::TrySendError::Full(fin)) => {
+                if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                    let writer_tx = self.writer_tx.clone();
+                    handle.spawn(async move {
+                        let _ = writer_tx.send(fin).await;
+                    });
+                } else {
+                    self.fin_sent.store(false, Ordering::Release);
+                }
+            }
         }
     }
 
@@ -150,11 +163,11 @@ impl Stream {
     /// Send data through the writer channel (无锁方式)
     ///
     /// 这个方法可以被多个任务并发调用，无需任何锁
-    pub fn send_data(
+    pub async fn send_data(
         &self,
         data: Bytes,
     ) -> std::result::Result<(), mpsc::error::SendError<(u32, Bytes)>> {
-        self.writer_tx.send((self.id, data))
+        self.writer_tx.send((self.id, data)).await
     }
 }
 
@@ -211,7 +224,7 @@ impl AsyncRead for Stream {
 impl AsyncWrite for Stream {
     fn poll_write(
         self: Pin<&mut Self>,
-        _cx: &mut Context<'_>,
+        cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<std::io::Result<usize>> {
         let stream_id = self.id;
@@ -237,7 +250,7 @@ impl AsyncWrite for Stream {
             buf_len,
             stream_id
         );
-        match self.writer_tx.send((self.id, data)) {
+        match self.writer_tx.try_send((self.id, data)) {
             Ok(_) => {
                 tracing::debug!(
                     "[Stream] poll_write: Successfully sent {} bytes to channel for stream {}",
@@ -246,7 +259,20 @@ impl AsyncWrite for Stream {
                 );
                 Poll::Ready(Ok(buf.len()))
             }
-            Err(e) => {
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                    let writer_tx = self.writer_tx.clone();
+                    let waker = cx.waker().clone();
+                    handle.spawn(async move {
+                        let _ = writer_tx.reserve().await;
+                        waker.wake();
+                    });
+                } else {
+                    cx.waker().wake_by_ref();
+                }
+                Poll::Pending
+            }
+            Err(mpsc::error::TrySendError::Closed(e)) => {
                 tracing::error!(
                     "[Stream] poll_write: Failed to send {} bytes to channel for stream {}: {:?}",
                     buf_len,
@@ -265,10 +291,31 @@ impl AsyncWrite for Stream {
         Poll::Ready(Ok(()))
     }
 
-    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        // Emit a FIN and evict this stream from the session maps.
-        self.close();
-        Poll::Ready(Ok(()))
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        self.is_closed.store(true, Ordering::Relaxed);
+        if self.fin_sent.load(Ordering::Acquire) {
+            return Poll::Ready(Ok(()));
+        }
+
+        match self.writer_tx.try_send((self.id, Bytes::new())) {
+            Ok(()) | Err(mpsc::error::TrySendError::Closed(_)) => {
+                self.fin_sent.store(true, Ordering::Release);
+                Poll::Ready(Ok(()))
+            }
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                    let writer_tx = self.writer_tx.clone();
+                    let waker = cx.waker().clone();
+                    handle.spawn(async move {
+                        let _ = writer_tx.reserve().await;
+                        waker.wake();
+                    });
+                } else {
+                    cx.waker().wake_by_ref();
+                }
+                Poll::Pending
+            }
+        }
     }
 }
 
@@ -280,8 +327,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_stream_write() {
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        let (_reader_tx, reader_rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = mpsc::channel(1);
+        let (_reader_tx, reader_rx) = mpsc::channel(1);
 
         let reader = StreamReader::new(1, reader_rx);
         let (mut stream, _synack_rx) = Stream::new(1, reader, tx);
@@ -296,15 +343,77 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_send_data_waits_when_session_channel_is_full() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let (_reader_tx, reader_rx) = mpsc::channel(1);
+
+        let reader = StreamReader::new(1, reader_rx);
+        let (stream, _synack_rx) = Stream::new(1, reader, tx);
+
+        stream
+            .send_data(Bytes::from_static(b"first"))
+            .await
+            .unwrap();
+
+        let second_send = stream.send_data(Bytes::from_static(b"second"));
+        tokio::pin!(second_send);
+
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), &mut second_send)
+                .await
+                .is_err(),
+            "send_data should wait instead of queueing unbounded data"
+        );
+
+        let (_, first) = rx.recv().await.unwrap();
+        assert_eq!(first.as_ref(), b"first");
+
+        second_send.await.unwrap();
+        let (_, second) = rx.recv().await.unwrap();
+        assert_eq!(second.as_ref(), b"second");
+    }
+
+    #[tokio::test]
+    async fn test_shutdown_waits_until_fin_can_be_queued() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let (_reader_tx, reader_rx) = mpsc::channel(1);
+
+        let reader = StreamReader::new(1, reader_rx);
+        let (mut stream, _synack_rx) = Stream::new(1, reader, tx);
+
+        stream
+            .send_data(Bytes::from_static(b"first"))
+            .await
+            .unwrap();
+
+        let shutdown = stream.shutdown();
+        tokio::pin!(shutdown);
+
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), &mut shutdown)
+                .await
+                .is_err(),
+            "shutdown should wait until the FIN sentinel can be queued"
+        );
+
+        let (_, first) = rx.recv().await.unwrap();
+        assert_eq!(first.as_ref(), b"first");
+
+        shutdown.await.unwrap();
+        let (_, fin) = rx.recv().await.unwrap();
+        assert!(fin.is_empty());
+    }
+
+    #[tokio::test]
     async fn test_stream_read() {
-        let (tx, _rx) = mpsc::unbounded_channel();
-        let (reader_tx, reader_rx) = mpsc::unbounded_channel();
+        let (tx, _rx) = mpsc::channel(1);
+        let (reader_tx, reader_rx) = mpsc::channel(1);
 
         let reader = StreamReader::new(1, reader_rx);
         let (mut stream, _synack_rx) = Stream::new(1, reader, tx);
 
         // 发送数据到 reader
-        reader_tx.send(Bytes::from("world")).unwrap();
+        reader_tx.send(Bytes::from("world")).await.unwrap();
 
         // 读取数据
         let mut buf = vec![0u8; 10];
@@ -316,14 +425,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_stream_read_write() {
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        let (reader_tx, reader_rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = mpsc::channel(1);
+        let (reader_tx, reader_rx) = mpsc::channel(1);
 
         let reader = StreamReader::new(1, reader_rx);
         let (mut stream, _synack_rx) = Stream::new(1, reader, tx);
 
         // 同时读写
-        reader_tx.send(Bytes::from("input")).unwrap();
+        reader_tx.send(Bytes::from("input")).await.unwrap();
         stream.write_all(b"output").await.unwrap();
 
         // 验证读取

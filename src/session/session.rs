@@ -2,7 +2,7 @@
 
 use crate::padding::PaddingFactory;
 use crate::protocol::{Command, Frame, FrameCodec};
-use crate::session::Stream;
+use crate::session::{STREAM_CHANNEL_CAPACITY, Stream};
 use crate::util::{AnyTlsError, Result, StringMap};
 use bytes::{Bytes, BytesMut};
 use md5;
@@ -33,7 +33,7 @@ struct HeartbeatState {
 }
 
 /// Session manages multiple streams over a single TLS connection
-type StreamDataReceiver = mpsc::UnboundedReceiver<(u32, Bytes)>;
+type StreamDataReceiver = mpsc::Receiver<(u32, Bytes)>;
 
 pub struct Session {
     id: u64,
@@ -46,11 +46,11 @@ pub struct Session {
     stream_id: Arc<std::sync::atomic::AtomicU32>,
 
     // Channel for receiving data from streams
-    stream_data_tx: mpsc::UnboundedSender<(u32, Bytes)>,
+    stream_data_tx: mpsc::Sender<(u32, Bytes)>,
     stream_data_rx: Arc<tokio::sync::Mutex<Option<StreamDataReceiver>>>,
 
     // Channel for sending data to streams (stream_id -> sender)
-    stream_receive_tx: Arc<RwLock<HashMap<u32, mpsc::UnboundedSender<Bytes>>>>,
+    stream_receive_tx: Arc<RwLock<HashMap<u32, mpsc::Sender<Bytes>>>>,
 
     // Session state
     is_closed: Arc<std::sync::atomic::AtomicBool>,
@@ -115,7 +115,7 @@ impl Session {
         R: AsyncRead + Send + Unpin + 'static,
         W: AsyncWrite + Send + Unpin + 'static,
     {
-        let (stream_data_tx, stream_data_rx) = mpsc::unbounded_channel();
+        let (stream_data_tx, stream_data_rx) = mpsc::channel(STREAM_CHANNEL_CAPACITY);
         let id = SESSION_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let heartbeat_state = heartbeat.map(|cfg| {
             Arc::new(HeartbeatState {
@@ -156,7 +156,7 @@ impl Session {
         R: AsyncRead + Send + Unpin + 'static,
         W: AsyncWrite + Send + Unpin + 'static,
     {
-        let (stream_data_tx, stream_data_rx) = mpsc::unbounded_channel();
+        let (stream_data_tx, stream_data_rx) = mpsc::channel(STREAM_CHANNEL_CAPACITY);
         let id = SESSION_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
         Self {
@@ -447,52 +447,80 @@ impl Session {
                     data_len
                 );
 
-                let receive_map = self.stream_receive_tx.read().await;
-                tracing::trace!(
-                    session_id = session_id,
-                    "[Session] handle_frame: Acquired stream_receive_tx read lock for stream {}",
-                    frame.stream_id
-                );
-
-                if let Some(tx) = receive_map.get(&frame.stream_id) {
+                let tx = {
+                    let receive_map = self.stream_receive_tx.read().await;
                     tracing::trace!(
                         session_id = session_id,
-                        "[Session] handle_frame: Found receiver for stream {}, sending {} bytes",
-                        frame.stream_id,
-                        data_len
+                        "[Session] handle_frame: Acquired stream_receive_tx read lock for stream {}",
+                        frame.stream_id
                     );
-                    match tx.send(frame.data.clone()) {
-                        Ok(_) => {
-                            tracing::debug!(
+
+                    match receive_map.get(&frame.stream_id) {
+                        Some(tx) => {
+                            tracing::trace!(
                                 session_id = session_id,
-                                "[Session] handle_frame: Successfully sent {} bytes to stream {} via channel",
-                                data_len,
-                                frame.stream_id
-                            );
-                        }
-                        Err(e) => {
-                            tracing::error!(
-                                session_id = session_id,
-                                "[Session] handle_frame: Failed to send {} bytes to stream {} via channel: {}",
-                                data_len,
+                                "[Session] handle_frame: Found receiver for stream {}, sending {} bytes",
                                 frame.stream_id,
-                                e
+                                data_len
                             );
+                            Some(tx.clone())
+                        }
+                        None => {
+                            tracing::warn!(
+                                session_id = session_id,
+                                "[Session] handle_frame: No receiver found for stream {} (available streams: {:?})",
+                                frame.stream_id,
+                                receive_map.keys().collect::<Vec<_>>()
+                            );
+                            None
                         }
                     }
-                } else {
-                    tracing::warn!(
-                        session_id = session_id,
-                        "[Session] handle_frame: No receiver found for stream {} (available streams: {:?})",
-                        frame.stream_id,
-                        receive_map.keys().collect::<Vec<_>>()
-                    );
-                }
-                drop(receive_map);
+                };
+
                 tracing::trace!(
                     session_id = session_id,
                     "[Session] handle_frame: Released stream_receive_tx read lock"
                 );
+
+                if let Some(tx) = tx {
+                    if self.is_closed() {
+                        return Err(AnyTlsError::SessionClosed);
+                    }
+
+                    let close_notify = Arc::clone(&self.close_notify);
+                    tokio::select! {
+                        result = tx.send(frame.data) => {
+                            match result {
+                                Ok(_) => {
+                                    tracing::debug!(
+                                        session_id = session_id,
+                                        "[Session] handle_frame: Successfully sent {} bytes to stream {} via channel",
+                                        data_len,
+                                        frame.stream_id
+                                    );
+                                }
+                                Err(e) => {
+                                    tracing::error!(
+                                        session_id = session_id,
+                                        "[Session] handle_frame: Failed to send {} bytes to stream {} via channel: {}",
+                                        data_len,
+                                        frame.stream_id,
+                                        e
+                                    );
+                                }
+                            }
+                        }
+                        _ = close_notify.notified() => {
+                            tracing::debug!(
+                                session_id = session_id,
+                                "[Session] handle_frame: Session closed while sending {} bytes to stream {}",
+                                data_len,
+                                frame.stream_id
+                            );
+                            return Err(AnyTlsError::SessionClosed);
+                        }
+                    }
+                }
             }
             Command::Syn => {
                 // Stream open (server side)
@@ -504,7 +532,7 @@ impl Session {
                         stream_id
                     );
 
-                    let (receive_tx, receive_rx) = mpsc::unbounded_channel();
+                    let (receive_tx, receive_rx) = mpsc::channel(STREAM_CHANNEL_CAPACITY);
 
                     // 创建 StreamReader
                     let reader = crate::session::StreamReader::new(stream_id, receive_rx);
@@ -796,7 +824,7 @@ impl Session {
         );
 
         // Create channels for this stream
-        let (receive_tx, receive_rx) = mpsc::unbounded_channel();
+        let (receive_tx, receive_rx) = mpsc::channel(STREAM_CHANNEL_CAPACITY);
 
         // 创建 StreamReader
         let reader = crate::session::StreamReader::new(stream_id, receive_rx);
