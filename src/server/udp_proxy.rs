@@ -349,7 +349,7 @@ async fn udp_to_stream(
         let packet = encode_udp_packet_simple(&buf[..len])?;
 
         // Send to Stream using the send_data method
-        if let Err(e) = stream.send_data(packet) {
+        if let Err(e) = stream.send_data(packet).await {
             tracing::error!("[UDP] Failed to send to stream: {}", e);
             return Err(AnyTlsError::Protocol("Channel send failed".into()));
         }

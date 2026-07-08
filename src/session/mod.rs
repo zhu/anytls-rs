@@ -6,3 +6,5 @@ pub mod stream_reader;
 pub use session::{Session, SessionHeartbeatConfig};
 pub use stream::Stream;
 pub use stream_reader::StreamReader;
+
+pub(crate) const STREAM_CHANNEL_CAPACITY: usize = 64;
