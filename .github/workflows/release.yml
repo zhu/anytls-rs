@@ -4,10 +4,11 @@ on:
   push:
     tags:
       - 'v*'
+      - 'custom-v*'
   workflow_dispatch:
     inputs:
       version:
-        description: 'Version tag (e.g., v0.3.0)'
+        description: 'Version tag (e.g., custom-v0.3.0)'
         required: true
         type: string
 
@@ -223,6 +224,7 @@ jobs:
     name: Publish to crates.io
     needs: build
     runs-on: ubuntu-latest
+    if: false
     permissions:
       contents: read
     steps:
