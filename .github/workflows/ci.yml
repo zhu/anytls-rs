@@ -20,10 +20,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        # Match Release: locked cmake cannot detect windows-latest's VS 2026 yet.
+        os: [ubuntu-latest, macos-latest, windows-2022]
         rust: [stable, beta]
         exclude:
-          - os: windows-latest
+          - os: windows-2022
             rust: beta
     steps:
       - uses: actions/checkout@v4
