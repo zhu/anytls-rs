@@ -127,7 +127,6 @@ jobs:
       
       - name: Run cargo audit
         run: cargo audit
-        continue-on-error: true
 
 
   interoperability:

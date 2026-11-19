@@ -67,6 +67,19 @@ SYNACK 超时保护来自 **2.2.94 beta** 公告，不应表述为已经在 2.2.
 - 服务端要求 Settings 先于 SYN，SID 非零并严格递增；合法 SID 跳号仍然允许。
 - 证书状态按当前时钟计算，过期后的第一秒即可被识别；证书监控独立于文件监听开关。
   热重载拒绝已过期或尚未生效的新证书，保留当前有效配置。
+- 更新锁定依赖并将旧 Trust-DNS 自定义解析器迁移到 Hickory 0.26.3；新增真实回环 DNS
+  回归验证非53端口、A/AAAA 答案、UDP 截断后的 TCP 回退及缓存目标端口隔离。
+
+### 依赖与客户端维护记录
+
+2026-11-19 的固定 RustSec 数据库审计由18条漏洞记录降为0条，保留3条停止维护提示，
+没有忽略 advisory；范围和原始记录见 [DEPENDENCY_AUDIT.md](DEPENDENCY_AUDIT.md)。
+CI 与 Release 对依赖审计失败执行阻断，不再使用允许失败的绿色状态。
+
+仓库自带 Rust 客户端的16份问题正文及复现材料保存在独立的
+[client-issue-drafts 分支](https://github.com/zhu/anytls-rs/tree/custom/client-issue-drafts/docs/client-issues)。
+创建时仓库关闭了 Issues（GitHub API 410），因此这些是待导入的草稿。
+本版本的真实客户端互通结论针对上表中的 Rust 服务端使用方式。
 
 ## 运行配置
 

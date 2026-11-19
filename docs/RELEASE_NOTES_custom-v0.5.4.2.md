@@ -16,6 +16,17 @@ Its binary/Cargo version is `0.5.4-custom.2`; the tag follows this fork's existi
 - Fragment large stream writes into legal AnyTLS PSH frames; ignore empty PSH and reject oversized control frames.
 - Enforce Settings before SYN and nonzero increasing stream IDs; match UoT magic domains exactly.
 - Recompute certificate expiry at the current time, independently of file watching, and reject expired or not-yet-valid certificate renewals without replacing the working configuration.
+- Update the locked TLS, buffer, runtime, and other affected dependencies; replace the obsolete Trust-DNS resolver with Hickory 0.26.3 while preserving custom DNS ports and UDP/TCP fallback.
+
+## Dependency audit
+
+The 2026-11-19 RustSec snapshot reports zero vulnerability records after the updates,
+down from eighteen before them. Three unmaintained-package notices remain visible:
+Chrono, pin-utils, and rustls-pemfile. These counts include the full lockfile and do
+not imply that every original advisory was reachable from the server.
+See `docs/DEPENDENCY_AUDIT.md` for pinned database evidence and package versions.
+CI now fails on an unsuccessful dependency audit, and Release verification also
+runs the audit before publishing assets.
 
 ## Compatibility verification
 
@@ -41,4 +52,8 @@ Existing listen/password/certificate arguments remain valid. New optional flags:
 
 These do not impose a traffic idle timeout on authenticated streams. Increase the connection limit
 for larger deployments. Server `-I/-T/-M` hints do not override the inspected dae client's own pool policy.
-The bundled Rust client is not the focus of this release's interoperability validation.
+The bundled Rust client retains known issues, including authentication interoperability,
+TLS verification defaults, and frontend/UDP lifecycle behavior. This release's
+interoperability validation covers the Rust server. Reviewed client findings and
+reproductions are tracked in the separate
+[client issue draft branch](https://github.com/zhu/anytls-rs/tree/custom/client-issue-drafts/docs/client-issues).
