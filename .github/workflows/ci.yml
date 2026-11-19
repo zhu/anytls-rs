@@ -47,17 +47,17 @@ jobs:
         continue-on-error: false
       
       - name: Clippy
-        run: cargo clippy --all-targets --all-features -- -D warnings
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
         continue-on-error: false
       
       - name: Build
-        run: cargo build --verbose --all-features
+        run: cargo build --locked --verbose --all-features
       
       - name: Run tests
-        run: cargo test --verbose --all-features
+        run: cargo test --locked --verbose --all-features
       
       - name: Build binaries
-        run: cargo build --release --verbose --bin anytls-client --bin anytls-server
+        run: cargo build --locked --release --verbose --bin anytls-client --bin anytls-server
       
       - name: Upload artifacts
         if: matrix.os == 'ubuntu-latest' && matrix.rust == 'stable'
@@ -121,3 +121,22 @@ jobs:
         run: cargo audit
         continue-on-error: true
 
+
+  interoperability:
+    name: dae and reference client interoperability
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.24.x'
+          cache-dependency-path: tests/interop/*/go.sum
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --locked --bin anytls-server
+      - name: Run actual client transports
+        run: |
+          SERVER_BINARY="$GITHUB_WORKSPACE/target/debug/anytls-server"
+          for client in dae reference; do
+            (cd "tests/interop/$client" && go run -mod=readonly -buildvcs=false . -server-binary "$SERVER_BINARY")
+          done
