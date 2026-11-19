@@ -1,6 +1,8 @@
 //! Certificate reloader with file watching and hot reload support
 
-use crate::util::{AnyTlsError, CertificateInfo, Result, create_server_config_from_files};
+use crate::util::{
+    AnyTlsError, CertStatus, CertificateInfo, Result, create_server_config_from_files,
+};
 use notify::{Config, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
@@ -142,13 +144,20 @@ impl CertReloader {
 
         // Check expiry
         if self.config.check_expiry {
-            if new_cert_info.is_expired() {
-                return Err(AnyTlsError::Tls("New certificate has expired".to_string()));
-            } else if new_cert_info.is_expiring_soon(self.config.expiry_warning_days) {
-                warn!(
+            match new_cert_info.status(self.config.expiry_warning_days) {
+                CertStatus::Expired => {
+                    return Err(AnyTlsError::Tls("New certificate has expired".into()));
+                }
+                CertStatus::Invalid(reason) => {
+                    return Err(AnyTlsError::Tls(format!(
+                        "New certificate is invalid: {reason}"
+                    )));
+                }
+                CertStatus::ExpiringWarning(days) => warn!(
                     "[CertReloader] WARNING: New certificate expiring in {} days",
-                    new_cert_info.days_remaining()
-                );
+                    days
+                ),
+                CertStatus::Valid => {}
             }
         }
 
