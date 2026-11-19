@@ -17,13 +17,15 @@ use trust_dns_resolver::config::{NameServerConfig, Protocol, ResolverConfig, Res
 const DEFAULT_TTL: Duration = Duration::from_secs(60);
 /// Timeout for DNS lookup operations.
 const DNS_TIMEOUT: Duration = Duration::from_secs(10);
+/// Bound memory retained for client-controlled hostnames.
+const MAX_CACHE_ENTRIES: usize = 4096;
 
 static DNS_CACHE: Lazy<DnsCache> = Lazy::new(DnsCache::new);
 static DNS_RESOLVER: Lazy<RwLock<Option<Arc<TokioAsyncResolver>>>> =
     Lazy::new(|| RwLock::new(None));
 
 struct CacheEntry {
-    addresses: Vec<SocketAddr>,
+    addresses: Vec<IpAddr>,
     expires_at: Instant,
     next_index: usize,
 }
@@ -39,37 +41,49 @@ impl DnsCache {
         }
     }
 
-    async fn get(&self, host: &str) -> Option<SocketAddr> {
-        let cache = self.inner.read().await;
-        if let Some(entry) = cache.get(host)
-            && Instant::now() <= entry.expires_at
-            && !entry.addresses.is_empty()
-        {
-            let index = entry.next_index % entry.addresses.len();
-            let addr = entry.addresses[index];
-            trace!("[DNS] Cache hit for {} -> {}", host, addr);
-            return Some(addr);
+    async fn get(&self, host: &str, port: u16) -> Option<Vec<SocketAddr>> {
+        let mut cache = self.inner.write().await;
+        let entry = cache.get_mut(host)?;
+        if Instant::now() >= entry.expires_at || entry.addresses.is_empty() {
+            cache.remove(host);
+            return None;
         }
-        None
+        // Select and advance under one lock, so concurrent requests rotate too.
+        let index = entry.next_index % entry.addresses.len();
+        entry.next_index = (index + 1) % entry.addresses.len();
+        let addresses = entry.addresses[index..]
+            .iter()
+            .chain(&entry.addresses[..index])
+            .map(|ip| SocketAddr::new(*ip, port))
+            .collect();
+        trace!("[DNS] Cache hit for {}", host);
+        Some(addresses)
     }
 
-    async fn insert(&self, host: String, addresses: Vec<SocketAddr>) {
+    async fn insert(&self, host: String, addresses: Vec<IpAddr>) {
         let mut cache = self.inner.write().await;
+        if cache.len() >= MAX_CACHE_ENTRIES && !cache.contains_key(&host) {
+            let now = Instant::now();
+            cache.retain(|_, entry| entry.expires_at > now);
+            if cache.len() >= MAX_CACHE_ENTRIES {
+                let oldest = cache
+                    .iter()
+                    .min_by_key(|(_, entry)| entry.expires_at)
+                    .map(|(host, _)| host.clone());
+                if let Some(oldest) = oldest {
+                    cache.remove(&oldest);
+                }
+            }
+        }
         cache.insert(
             host,
             CacheEntry {
                 addresses,
                 expires_at: Instant::now() + DEFAULT_TTL,
-                next_index: 0,
+                // The lookup that fills this entry uses the first address.
+                next_index: 1,
             },
         );
-    }
-
-    async fn advance(&self, host: &str) {
-        let mut cache = self.inner.write().await;
-        if let Some(entry) = cache.get_mut(host) {
-            entry.next_index = entry.next_index.wrapping_add(1);
-        }
     }
 
     async fn clear(&self) {
@@ -78,58 +92,57 @@ impl DnsCache {
     }
 }
 
-/// Resolve a hostname with caching and timeout.
+/// Resolve one address, rotating cached IPs and attaching this request's port.
 pub async fn resolve_host_with_cache(host: &str, port: u16) -> Result<SocketAddr> {
+    resolve_host_addresses_with_cache(host, port)
+        .await?
+        .into_iter()
+        .next()
+        .ok_or_else(|| AnyTlsError::Protocol(format!("No address found for {}", host)))
+}
+
+/// Resolve all candidate addresses with caching and timeout.
+///
+/// Only IPs are cached: ports belong to individual proxy requests. Cached results
+/// rotate their starting address but retain every candidate for dial fallback.
+pub async fn resolve_host_addresses_with_cache(host: &str, port: u16) -> Result<Vec<SocketAddr>> {
     if let Ok(ip) = host.parse::<IpAddr>() {
-        return Ok(SocketAddr::new(ip, port));
+        return Ok(vec![SocketAddr::new(ip, port)]);
     }
 
-    if let Some(addr) = DNS_CACHE.get(host).await {
-        DNS_CACHE.advance(host).await;
-        return Ok(addr);
+    if let Some(addresses) = DNS_CACHE.get(host, port).await {
+        return Ok(addresses);
     }
 
     let resolver_opt = DNS_RESOLVER.read().await.clone();
-    let mut addresses: Vec<SocketAddr> = if let Some(resolver) = resolver_opt {
-        let lookup = tokio::time::timeout(DNS_TIMEOUT, resolver.lookup_ip(host))
-            .await
-            .map_err(|_| {
-                AnyTlsError::Protocol(format!(
-                    "DNS resolution timeout ({}s) for {}",
-                    DNS_TIMEOUT.as_secs(),
-                    host
-                ))
-            })?
-            .map_err(|err| {
-                AnyTlsError::Io(Error::other(format!(
-                    "DNS resolution failed for {}: {}",
-                    host, err
-                )))
-            })?;
-        let mut addrs = Vec::new();
-        for ip in lookup.iter() {
-            addrs.push(SocketAddr::new(ip, port));
+    let lookup = async {
+        if let Some(resolver) = resolver_opt {
+            resolver
+                .lookup_ip(host)
+                .await
+                .map(|lookup| lookup.iter().collect::<Vec<_>>())
+                .map_err(|err| Error::other(err.to_string()))
+        } else {
+            lookup_host((host, 0))
+                .await
+                .map(|lookup| lookup.map(|address| address.ip()).collect::<Vec<_>>())
         }
-        addrs
-    } else {
-        let lookup_future = lookup_host((host, port));
-        tokio::time::timeout(DNS_TIMEOUT, lookup_future)
-            .await
-            .map_err(|_| {
-                AnyTlsError::Protocol(format!(
-                    "DNS resolution timeout ({}s) for {}",
-                    DNS_TIMEOUT.as_secs(),
-                    host
-                ))
-            })?
-            .map_err(|err| {
-                AnyTlsError::Io(Error::other(format!(
-                    "DNS resolution failed for {}: {}",
-                    host, err
-                )))
-            })?
-            .collect::<Vec<_>>()
     };
+    let mut addresses = tokio::time::timeout(DNS_TIMEOUT, lookup)
+        .await
+        .map_err(|_| {
+            AnyTlsError::Protocol(format!(
+                "DNS resolution timeout ({}s) for {}",
+                DNS_TIMEOUT.as_secs(),
+                host
+            ))
+        })?
+        .map_err(|err| {
+            AnyTlsError::Io(Error::other(format!(
+                "DNS resolution failed for {}: {}",
+                host, err
+            )))
+        })?;
 
     if addresses.is_empty() {
         return Err(AnyTlsError::Protocol(format!(
@@ -138,22 +151,20 @@ pub async fn resolve_host_with_cache(host: &str, port: u16) -> Result<SocketAddr
         )));
     }
 
-    // Sort to keep stability across runs (helps caching)
-    addresses.sort_unstable_by_key(|addr| match addr.ip() {
-        IpAddr::V4(ip) => (0, ip.octets().to_vec()),
-        IpAddr::V6(ip) => (1, ip.octets().to_vec()),
-    });
-
+    // Stable order on the first lookup; subsequent hits rotate the candidates.
+    addresses.sort_unstable();
+    addresses.dedup();
     debug!(
         "[DNS] Resolved {} -> {} entries (ttl={}s)",
         host,
         addresses.len(),
         DEFAULT_TTL.as_secs()
     );
-
     DNS_CACHE.insert(host.to_string(), addresses.clone()).await;
-    DNS_CACHE.advance(host).await;
-    Ok(addresses[0])
+    Ok(addresses
+        .into_iter()
+        .map(|ip| SocketAddr::new(ip, port))
+        .collect())
 }
 
 pub async fn set_custom_dns_servers(servers: &[String]) -> Result<()> {
@@ -225,4 +236,61 @@ fn parse_dns_server(entry: &str) -> std::io::Result<SocketAddr> {
         ErrorKind::InvalidInput,
         format!("invalid DNS server '{}'", entry),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn cached_dns_keeps_request_ports_and_all_candidates() {
+        let cache = DnsCache::new();
+        let ips = vec!["127.0.0.1".parse().unwrap(), "::1".parse().unwrap()];
+        cache.insert("example.test".into(), ips.clone()).await;
+        let https = cache.get("example.test", 443).await.unwrap();
+        let http = cache.get("example.test", 80).await.unwrap();
+        assert_eq!(
+            https,
+            vec![SocketAddr::new(ips[1], 443), SocketAddr::new(ips[0], 443)]
+        );
+        assert_eq!(
+            http,
+            vec![SocketAddr::new(ips[0], 80), SocketAddr::new(ips[1], 80)]
+        );
+    }
+
+    #[tokio::test]
+    async fn expired_entries_are_removed_and_cache_is_bounded() {
+        let cache = DnsCache::new();
+        let ip = "127.0.0.1".parse().unwrap();
+        cache.insert("expired.test".into(), vec![ip]).await;
+        cache
+            .inner
+            .write()
+            .await
+            .get_mut("expired.test")
+            .unwrap()
+            .expires_at = Instant::now();
+        assert!(cache.get("expired.test", 80).await.is_none());
+        assert!(cache.inner.read().await.is_empty());
+        for index in 0..=MAX_CACHE_ENTRIES {
+            cache.insert(format!("{}.test", index), vec![ip]).await;
+        }
+        assert_eq!(cache.inner.read().await.len(), MAX_CACHE_ENTRIES);
+        assert!(cache.get("0.test", 80).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn ip_literals_keep_the_requested_port() {
+        assert_eq!(
+            resolve_host_with_cache("::1", 5353).await.unwrap(),
+            "[::1]:5353".parse().unwrap()
+        );
+        assert_eq!(
+            resolve_host_addresses_with_cache("127.0.0.1", 443)
+                .await
+                .unwrap(),
+            vec!["127.0.0.1:443".parse().unwrap()]
+        );
+    }
 }
