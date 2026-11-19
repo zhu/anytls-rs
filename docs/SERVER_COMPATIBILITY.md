@@ -22,6 +22,32 @@ Cargo 与二进制版本使用合法的 SemVer `0.5.4-custom.2`；GitHub tag 沿
 - AnyTLS 参考：[fd6167acd6d73b9fa3e607659951847fbc9e6c50](https://github.com/anytls/anytls-go/tree/fd6167acd6d73b9fa3e607659951847fbc9e6c50)，UoT codec 为 `github.com/sagernet/sing v0.5.1`。
 - UoT 公开格式：[sing-box 文档](https://sing-box.sagernet.org/configuration/shared/udp-over-tcp/)。
 
+### Shadowrocket 公开资料对照（2026-11-19）
+
+检索到的详细一手资料主要是开发者的版本公告，没有找到完整的 AnyTLS 源码或逐字段实现文档。
+来源身份通过 [App Store 的 Developer Website](https://apps.apple.com/us/app/shadowrocket/id932747118)
+→ [开发者网站](https://shadowlaunch.com/) → [官方讨论群](https://t.me/ShadowrocketApp)
+→ [公告频道](https://t.me/ShadowrocketNews) 核对。
+
+| 官方公开的行为或变更 | 服务端对照与验证 | 仍未公开的细节 |
+| --- | --- | --- |
+| [2.2.65 正式版：修复 padding 更新](https://t.me/ShadowrocketNews/960) | Settings 中的 MD5 不一致时返回原始 scheme；新增 wire 回归使用自定义 scheme 检查完整响应及 MD5 相同时不重复下发 | Shadowrocket 的 scheme 缓存作用域、包计数及全部自定义方案行为 |
+| [2.2.66 beta 2620：修复 session 读取长度](https://t.me/ShadowrocketNews/965) | 大应用写拆成不超过 65,535 字节的 PSH；最大 IPv6 UDP 回包跨帧验证通过 | 旧限制数值和客户端内部缓冲策略 |
+| [2.2.73 beta 2904：修复 FIN 应答处理](https://t.me/ShadowrocketNews/1198) | 按 AnyTLS 规范处理 FIN，清理流且不回声；回归覆盖 EOF、队列尾部数据和取消 | 公告未说明旧错误的具体形式，不能据此推导另一套 FIN 语义 |
+| [2.2.80 正式版：修复会话池和空闲管理](https://t.me/ShadowrocketNews/1342) | 正常结束单个流后保留 Session，支持心跳；真实客户端验证连续复用和空闲后复用 | Shadowrocket 的扫描间隔、空闲秒数、保留会话数及是否采用服务端提示 |
+| [2.2.81 beta 3210：调整初始握手，移除待发数据合并](https://t.me/ShadowrocketNews/1449) | SOCKS 地址按字节流解析，允许地址跨 PSH 分片及业务数据另行发送；参考客户端 fixture 逐字节拆分地址 | 公告没有给出调整后的每次 TLS Write 布局 |
+| [2.2.94 beta 3494：为复用的 v2 会话增加 SYNACK 超时保护](https://t.me/ShadowrocketNews/1670) | 每个 v2 流均处理成功或失败 SYNACK，覆盖首次建流与后续复用；FIN 不会截断进行中的共享控制帧写入 | SYNACK 定时器的具体秒数；不能代入 dae 或 anytls-go 的数值 |
+
+上述资料与当前服务端代码的对照没有发现新的、证据充分的生产实现缺陷。
+协议中的认证、Settings、帧布局和 FIN 语义仍以
+[AnyTLS 规范](https://github.com/anytls/anytls-go/blob/fd6167acd6d73b9fa3e607659951847fbc9e6c50/docs/protocol.md)
+为依据。Shadowrocket 的实际 UoT 版本/模式选择、移动网络切换和后台恢复仍没有实机证据。
+服务端同时支持 UoT v1/v2 和 v2 的两种模式，以容纳符合公开格式的客户端选择。
+
+SYNACK 超时保护来自 **2.2.94 beta** 公告，不应表述为已经在 2.2.93 正式版落地。
+服务端的 DNS/连接总期限为 15 秒，并以 250ms 间隔启动后续地址候选；不能据此保证慢目标一定
+赶在未公开的客户端定时器前完成，也不应在目标连接成功前假报成功来迎合猜测的期限。
+
 ## 修复的行为
 
 - DNS 只缓存 IP，访问同一域名的不同端口不会串用端口；TCP 会尝试解析出的多个地址。
@@ -80,5 +106,6 @@ SERVER_BINARY="$(pwd)/target/debug/anytls-server"
 两个 Go fixture 各自启动并清理 Rust 服务端与 TCP/UDP 目标。任一断言失败都会返回非零状态。
 IPv6 测试需要本机启用 IPv6 回环。测试细节与固定版本见各 fixture 的 README。
 
-Release 工作流在所有验证和七个平台的构建成功后发布 tag、压缩包与 SHA256 文件。
-手动运行 Release 时填写完整 tag（例如 `custom-v0.5.4.2`）；版本不匹配或已有 tag 指向另一提交时会拒绝发布。
+Release 工作流由 `v*` / `custom-v*` tag 的 push 触发，也支持手动输入完整 tag（例如 `custom-v0.5.4.2`）。
+tag 触发使用已经推送的 tag；手动触发会在验证成功后创建 tag。两种方式都在所有验证和七个平台的
+构建成功后发布 Release、压缩包与 SHA256 文件。版本不匹配或已有 tag 指向另一提交时会拒绝发布。

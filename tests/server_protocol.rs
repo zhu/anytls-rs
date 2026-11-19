@@ -12,10 +12,17 @@ use tokio_util::codec::{Decoder, Encoder};
 const DEADLINE: Duration = Duration::from_secs(2);
 
 async fn feed_server(frames: Vec<Frame>) -> (bool, Vec<Arc<Stream>>, Vec<Frame>) {
+    feed_server_with_padding(frames, PaddingFactory::default()).await
+}
+
+async fn feed_server_with_padding(
+    frames: Vec<Frame>,
+    padding: Arc<PaddingFactory>,
+) -> (bool, Vec<Arc<Stream>>, Vec<Frame>) {
     let (transport, peer) = duplex(65536);
     let (reader, writer) = tokio::io::split(transport);
     let (mut peer_reader, mut peer_writer) = tokio::io::split(peer);
-    let mut server = Session::new_server(reader, writer, PaddingFactory::default());
+    let mut server = Session::new_server(reader, writer, padding);
     let (streams_tx, mut streams_rx) = mpsc::unbounded_channel();
     server.set_stream_callback(streams_tx);
     let server = Arc::new(server);
@@ -51,6 +58,44 @@ async fn feed_server(frames: Vec<Frame>) -> (bool, Vec<Arc<Stream>>, Vec<Frame>)
 
 fn settings(version: u8) -> Frame {
     Frame::with_data(Command::Settings, 0, Bytes::from(format!("v={version}")))
+}
+
+#[tokio::test]
+async fn padding_negotiation_returns_exact_server_scheme_only_on_md5_mismatch() {
+    let raw_scheme = b"stop=3\n0=20-20\n1=80-80\n2=120-120";
+    let padding = Arc::new(PaddingFactory::new(raw_scheme).unwrap());
+    for matches in [false, true] {
+        let client_md5 = if matches {
+            padding.md5()
+        } else {
+            "00000000000000000000000000000000"
+        };
+        let (accepted, streams, replies) = feed_server_with_padding(
+            vec![Frame::with_data(
+                Command::Settings,
+                0,
+                Bytes::from(format!("v=2\npadding-md5={client_md5}")),
+            )],
+            padding.clone(),
+        )
+        .await;
+        assert!(accepted);
+        assert!(streams.is_empty());
+        let updates: Vec<_> = replies
+            .iter()
+            .filter(|frame| frame.cmd == Command::UpdatePaddingScheme)
+            .collect();
+        assert_eq!(updates.len(), usize::from(!matches));
+        if let Some(update) = updates.first() {
+            assert_eq!(update.stream_id, 0);
+            assert_eq!(update.data.as_ref(), raw_scheme);
+        }
+        assert!(
+            replies
+                .iter()
+                .any(|frame| frame.cmd == Command::ServerSettings)
+        );
+    }
 }
 
 #[tokio::test]
