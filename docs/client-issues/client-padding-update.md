@@ -38,3 +38,7 @@ assert_eq!(PaddingFactory::default().md5(), before.md5());
 - 更新成功时后续新会话的 padding-md5 与实际策略一致，padding0 也使用更新结果。
 - 测试默认初始化后多次合法更新、非法更新保留旧值、重新连接继承更新，以及两个连接不同服务器的 Client 不相互覆盖。
 - Go 代码自身也存在进程全局 factory 的历史设计；本项 Client 级隔离要求依据协议文档，不声称 Go 示例已经实现这一隔离。
+
+## 依赖更新后的复核
+
+在服务端发布候选提交 [`c250994`](https://github.com/zhu/anytls-rs/tree/c250994c468a7e68d3aba8b2d45816e0a9d55f74) 更新依赖后，本项已再次运行并复现。客户端相关生产源码未改变；[补充输出与固定依赖](https://github.com/zhu/anytls-rs/blob/custom/client-issue-drafts/docs/client-issues/repro/VALIDATION_c250994.md)保留了本轮结果。

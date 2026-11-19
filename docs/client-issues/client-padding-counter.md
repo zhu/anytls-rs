@@ -36,3 +36,7 @@ stop=3
 - 第一笔 Session 写入使用策略1，认证只使用策略0，stop 边界与参考一致。
 - 加入固定无随机策略的计数测试，包含初始缓冲 Settings/SYN/目标地址的首次 flush。
 - 不把这项修复与 UpdatePaddingScheme 的持有/更新问题混成一个不可单独验证的变化。
+
+## 依赖更新后的复核
+
+在服务端发布候选提交 [`c250994`](https://github.com/zhu/anytls-rs/tree/c250994c468a7e68d3aba8b2d45816e0a9d55f74) 更新依赖后，本项已再次运行并复现。客户端相关生产源码未改变；[补充输出与固定依赖](https://github.com/zhu/anytls-rs/blob/custom/client-issue-drafts/docs/client-issues/repro/VALIDATION_c250994.md)保留了本轮结果。

@@ -25,3 +25,7 @@
 - 给创建代理流提供可配置的总连接/握手 deadline 或调用方取消机制，覆盖 DNS、TCP、TLS、认证及目标建立；明确阶段性和总体预算的关系。
 - CLI 前端实际使用该预算，并返回有用错误且清理未完成连接。
 - 覆盖 TCP 接受后 TLS 沉默、认证写阻塞、DNS/多地址连接失败、调用方取消；测试超时后没有任务、Stream 或 socket 遗留。
+
+## 依赖更新后的复核
+
+在服务端发布候选提交 [`c250994`](https://github.com/zhu/anytls-rs/tree/c250994c468a7e68d3aba8b2d45816e0a9d55f74) 更新依赖后，本项已再次运行并复现。客户端相关生产源码未改变；[补充输出与固定依赖](https://github.com/zhu/anytls-rs/blob/custom/client-issue-drafts/docs/client-issues/repro/VALIDATION_c250994.md)保留了本轮结果。

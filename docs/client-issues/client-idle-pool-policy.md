@@ -27,3 +27,7 @@
 - 将“拥有所有 Session 的注册表”和“可被复用的 idle 集合”分开；原有 FD 泄漏修复的所有权不能因为简单移除条目而丢失。
 - 按 Stream 生命周期取出/归还 idle Session，归还时记录真实 idle 起点；缺少 idle 时建立新 Session。
 - 测试并发活动流不会被当作 idle、顺序请求复用最近空闲会话、关闭/错误时正确归还或丢弃、清理保留较新的空闲会话，以及不存在原有 orphan Session/FD 回归。
+
+## 依赖更新后的复核
+
+在服务端发布候选提交 [`c250994`](https://github.com/zhu/anytls-rs/tree/c250994c468a7e68d3aba8b2d45816e0a9d55f74) 更新依赖后，本项已再次运行并复现。客户端相关生产源码未改变；[补充输出与固定依赖](https://github.com/zhu/anytls-rs/blob/custom/client-issue-drafts/docs/client-issues/repro/VALIDATION_c250994.md)保留了本轮结果。

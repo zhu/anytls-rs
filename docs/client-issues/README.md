@@ -54,3 +54,7 @@ python3 docs/client-issues/publish.py --apply
 第一条 Python 命令只预览标题；`--apply` 才逐条调用 GitHub 创建。程序固定写入 `zhu/anytls-rs`，
 检测现有标题或审计标识避免重复，某条失败会立即停止；已创建的 Issue 不会被覆盖。
 完整结构化内容保存在 [issues.json](issues.json)。
+
+## 发布候选依赖更新后的复核
+
+在`c250994`的更新依赖上重新运行了全部11项非UDP运行探针，结果仍能复现；[输出与重现方法](repro/VALIDATION_c250994.md)已保存。UDP运行探针没有在这一轮重跑，原有证据边界不变。

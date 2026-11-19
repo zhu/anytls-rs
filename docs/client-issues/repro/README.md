@@ -67,3 +67,7 @@ Control with one gathered 64-byte authentication write: SYNACK succeeds and targ
 ```
 
 The Go server log contains a `fallback` entry for the stock Rust attempt. The successful control uses the same Rust TLS/session implementation and target; only authentication is collected into one write. OS error wording can vary; rejection before target connection versus successful coalesced-auth control is the meaningful assertion.
+
+## Dependency-update revalidation
+
+The eleven non-UDP runtime findings were reproduced again against release-candidate commit `c250994` and its updated dependencies. See [the recorded output and pinned lockfile](VALIDATION_c250994.md). The UDP probes were not repeated in this pass.

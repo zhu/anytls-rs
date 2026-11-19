@@ -31,3 +31,7 @@ Go Client 独立跟踪所有会话，`Close()` 会取消客户端并关闭它们
 - 提供明确的 async `Client::shutdown/close`，关闭并等待该 Client 拥有的所有活动和空闲会话、池清理任务以及客户端 worker。
 - 定义 Drop 的取消语义；不能只停止清理任务却留下自持有的 Session。若允许外部 Session 在 Client 被 drop 后继续使用，也应提供不依赖调用方手动枚举 Session 的完整关闭途径。
 - 测试重复创建/关闭、健康心跳、空闲及活动流、并发关闭；确认 task/FD 数回落且无持有环。
+
+## 依赖更新后的复核
+
+在服务端发布候选提交 [`c250994`](https://github.com/zhu/anytls-rs/tree/c250994c468a7e68d3aba8b2d45816e0a9d55f74) 更新依赖后，本项已再次运行并复现。客户端相关生产源码未改变；[补充输出与固定依赖](https://github.com/zhu/anytls-rs/blob/custom/client-issue-drafts/docs/client-issues/repro/VALIDATION_c250994.md)保留了本轮结果。

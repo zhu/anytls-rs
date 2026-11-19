@@ -32,3 +32,7 @@
 - BIND / UDP ASSOCIATE 未实现时返回命令不支持并关闭请求，不建立目标 TCP 连接；未知值同样拒绝。
 - 若补充 UDP ASSOCIATE，应实现其独立 UDP socket、控制连接生命周期和返回 BND 地址语义，不能用当前固定目标 UDP helper 冒充该协议。
 - 表驱动验证每种 CMD、无效 RSV、成功/失败回复，并断言不支持请求不产生出站。
+
+## 依赖更新后的复核
+
+在服务端发布候选提交 [`c250994`](https://github.com/zhu/anytls-rs/tree/c250994c468a7e68d3aba8b2d45816e0a9d55f74) 更新依赖后，本项已再次运行并复现。客户端相关生产源码未改变；[补充输出与固定依赖](https://github.com/zhu/anytls-rs/blob/custom/client-issue-drafts/docs/client-issues/repro/VALIDATION_c250994.md)保留了本轮结果。

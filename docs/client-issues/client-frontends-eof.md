@@ -34,3 +34,7 @@ Go 示例在中继退出时 defer 关闭代理流：[cmd/client/inbound.go:49-57
 - 保留已经入队的有效尾部数据，并给无法完成的排空设置明确上界。
 - 不要在取消其中一个流时截断正在写入共享 TLS 会话的帧；已有 transport write guard 会关闭整个 Session，修复应避免误伤其他流。
 - 对 HTTP/SOCKS 分别测试本地 EOF、远端 FIN、目标读写失败、外层取消；断言对端 EOF、Stream map 清空、handler 结束及任务数不增长。
+
+## 依赖更新后的复核
+
+在服务端发布候选提交 [`c250994`](https://github.com/zhu/anytls-rs/tree/c250994c468a7e68d3aba8b2d45816e0a9d55f74) 更新依赖后，本项已再次运行并复现。客户端相关生产源码未改变；[补充输出与固定依赖](https://github.com/zhu/anytls-rs/blob/custom/client-issue-drafts/docs/client-issues/repro/VALIDATION_c250994.md)保留了本轮结果。
