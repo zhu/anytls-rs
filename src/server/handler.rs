@@ -482,12 +482,13 @@ mod tests {
         refused.bind("127.0.0.1:0".parse().unwrap()).unwrap();
         let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = target.local_addr().unwrap();
+        let refused_address = refused.local_addr().unwrap();
+        // Drop the reservation: Darwin/Windows need not immediately refuse a
+        // bound, non-listening socket as Linux does.
+        drop(refused);
         let stream = timeout(
             Duration::from_secs(2),
-            connect_candidates(
-                vec![refused.local_addr().unwrap(), address],
-                TcpStream::connect,
-            ),
+            connect_candidates(vec![refused_address, address], TcpStream::connect),
         )
         .await
         .unwrap()

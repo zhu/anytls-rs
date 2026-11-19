@@ -276,10 +276,12 @@ async fn peer_fin_drain_is_bounded_when_target_stops_reading() {
 async fn refused_target_reports_synack_error_then_fin() {
     let target = TcpSocket::new_v4().unwrap();
     target.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    let address = target.local_addr().unwrap();
+    // Darwin/Windows need not refuse a bound, non-listening socket immediately.
+    // Release it so this fixture exercises an actually closed destination.
+    drop(target);
     let mut proxy = Proxy::new().await;
-    proxy
-        .send(&ipv4_address(target.local_addr().unwrap()))
-        .await;
+    proxy.send(&ipv4_address(address)).await;
     let frames = proxy.until_fin().await;
     assert!(
         frames
