@@ -88,6 +88,25 @@ pub struct Session {
     close_complete: tokio::sync::Mutex<bool>,
 }
 
+/// A cancelled shared-transport write may have emitted a partial frame. Never
+/// let another stream reuse that byte stream; the session owner observes this
+/// durable close notification and completes teardown.
+struct TransportWriteGuard<'a> {
+    session: &'a Session,
+    complete: bool,
+}
+
+impl Drop for TransportWriteGuard<'_> {
+    fn drop(&mut self) {
+        if !self.complete {
+            self.session
+                .is_closed
+                .store(true, std::sync::atomic::Ordering::Release);
+            self.session.close_notify.send_replace(true);
+        }
+    }
+}
+
 impl Session {
     async fn handle_io_error(&self, context: &str, error: std::io::Error) -> AnyTlsError {
         tracing::error!(
@@ -944,7 +963,18 @@ impl Session {
 
     /// Write a control frame to connection
     pub async fn write_control_frame(&self, frame: Frame) -> Result<()> {
-        self.write_frame(frame).await
+        // Match anytls-go's five-second control-frame write deadline. Closing
+        // the whole session on timeout prevents a partial frame being reused.
+        match time::timeout(Duration::from_secs(5), self.write_frame(frame)).await {
+            Ok(result) => result,
+            Err(_) => {
+                let _ = self.close().await;
+                Err(AnyTlsError::Io(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "control frame write timed out (5s)",
+                )))
+            }
+        }
     }
 
     /// Write a frame to the connection
@@ -1047,19 +1077,30 @@ impl Session {
         use crate::protocol::{Command, HEADER_OVERHEAD_SIZE};
         use bytes::BufMut;
 
+        let mut writer = self.writer.lock().await;
+        // A previous write can be cancelled while this one waits for the lock.
+        // Its guard marks closed before releasing the lock; recheck here.
+        if self.is_closed() {
+            return Err(std::io::ErrorKind::NotConnected.into());
+        }
+        let mut write_guard = TransportWriteGuard {
+            session: self,
+            complete: false,
+        };
+
         if !self.send_padding {
             // No padding, write directly
             tracing::trace!(
                 "[Session] write_with_padding: Writing {} bytes without padding",
                 buffer.len()
             );
-            let mut writer = self.writer.lock().await;
             writer.write_all(&buffer).await?;
             writer.flush().await?;
             tracing::info!(
                 "[Session] write_with_padding: Successfully wrote {} bytes to connection",
                 buffer.len()
             );
+            write_guard.complete = true;
             return Ok(());
         }
 
@@ -1077,9 +1118,9 @@ impl Session {
             // Stop padding after stop packets
             // Note: We should probably disable send_padding, but that requires mutable access
             // For now, just write directly
-            let mut writer = self.writer.lock().await;
             writer.write_all(&buffer).await?;
             writer.flush().await?;
+            write_guard.complete = true;
             return Ok(());
         }
 
@@ -1088,13 +1129,11 @@ impl Session {
 
         // If no sizes defined, write directly
         if pkt_sizes.is_empty() {
-            let mut writer = self.writer.lock().await;
             writer.write_all(&buffer).await?;
             writer.flush().await?;
+            write_guard.complete = true;
             return Ok(());
         }
-
-        let mut writer = self.writer.lock().await;
 
         for size in pkt_sizes {
             let remain_payload_len = buffer.len();
@@ -1176,6 +1215,7 @@ impl Session {
         tracing::trace!("[Session] write_with_padding: Flushing writer");
         writer.flush().await?;
         tracing::debug!("[Session] write_with_padding: Successfully wrote and flushed data");
+        write_guard.complete = true;
         Ok(())
     }
 

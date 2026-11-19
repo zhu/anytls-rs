@@ -51,30 +51,7 @@ impl StreamHandler for TcpProxyHandler {
             // FIN is queued behind all successfully queued data, including when
             // the handler is cancelled. Remote FIN/session close suppresses it.
             let _close = CloseStreamOnDrop(stream.clone());
-            let proxy = handle_proxy_stream(stream.clone(), session.clone());
-            tokio::pin!(proxy);
-            tokio::select! {
-                biased;
-                _ = stream.closed() => {
-                    // PSH frames preceding FIN may still be queued. Give the
-                    // relay one bounded opportunity to deliver them before
-                    // dropping both directions. Session shutdown is immediate.
-                    tokio::select! {
-                        biased;
-                        _ = session.closed() => Ok(()),
-                        result = timeout(Duration::from_secs(1), &mut proxy) => {
-                            match result {
-                                Ok(result) => result,
-                                Err(_) => {
-                                    tracing::debug!(stream_id = stream.id(), "Stream close drain timed out");
-                                    Ok(())
-                                }
-                            }
-                        }
-                    }
-                }
-                result = &mut proxy => result,
-            }
+            handle_proxy_stream(stream, session).await
         })
     }
 }
@@ -107,32 +84,42 @@ async fn handle_proxy_stream(stream: Arc<Stream>, session: Arc<Session>) -> Resu
     let stream_id = stream.id();
     let peer_version = session.peer_version();
     let mut acknowledged = false;
+    let mut close_deadline = None;
     let result = async {
-        let destination = timeout(Duration::from_secs(15), read_socks_addr(stream.clone()))
-            .await
-            .map_err(|_| AnyTlsError::Protocol("SOCKS address timeout (15s)".into()))??;
+        let destination = run_stream_operation(&stream, &session, &mut close_deadline, async {
+            timeout(Duration::from_secs(15), read_socks_addr(stream.clone()))
+                .await
+                .map_err(|_| AnyTlsError::Protocol("SOCKS address timeout (15s)".into()))?
+        }).await?;
         tracing::info!(stream_id, host = %destination.addr, port = destination.port, "Proxy destination");
         if let Some(version) = uot_version(&destination.addr) {
             if peer_version >= 2 && !stream.is_closed() {
-                session.write_control_frame(Frame::control(Command::SynAck, stream_id)).await?;
+                finish_control_frame(&stream, &session, &mut close_deadline,
+                    Frame::control(Command::SynAck, stream_id)).await?;
             }
             acknowledged = true;
-            match version {
-                UotVersion::Legacy => crate::server::udp_proxy::handle_udp_over_tcp_v1(stream.clone()).await,
-                UotVersion::V2 => crate::server::udp_proxy::handle_udp_over_tcp(stream.clone()).await,
-            }
+            run_stream_operation(&stream, &session, &mut close_deadline, async {
+                match version {
+                    UotVersion::Legacy => crate::server::udp_proxy::handle_udp_over_tcp_v1(stream.clone()).await,
+                    UotVersion::V2 => crate::server::udp_proxy::handle_udp_over_tcp(stream.clone()).await,
+                }
+            }).await
         } else {
             // One deadline covers resolution and every fallback attempt.
-            let outbound = timeout(Duration::from_secs(15), async {
-                let addresses = resolve_host_addresses_with_cache(&destination.addr, destination.port).await?;
-                Ok::<_, AnyTlsError>(connect_candidates(addresses, TcpStream::connect).await?)
-            }).await.map_err(|_| AnyTlsError::Protocol(format!("Connection timeout (15s) to {}:{}", destination.addr, destination.port)))??;
+            let outbound = run_stream_operation(&stream, &session, &mut close_deadline, async {
+                timeout(Duration::from_secs(15), async {
+                    let addresses = resolve_host_addresses_with_cache(&destination.addr, destination.port).await?;
+                    Ok::<_, AnyTlsError>(connect_candidates(addresses, TcpStream::connect).await?)
+                }).await.map_err(|_| AnyTlsError::Protocol(format!("Connection timeout (15s) to {}:{}", destination.addr, destination.port)))?
+            }).await?;
             configure_tcp_stream(&outbound, &format!("{}:{}", destination.addr, destination.port));
             if peer_version >= 2 && !stream.is_closed() {
-                session.write_control_frame(Frame::control(Command::SynAck, stream_id)).await?;
+                finish_control_frame(&stream, &session, &mut close_deadline,
+                    Frame::control(Command::SynAck, stream_id)).await?;
             }
             acknowledged = true;
-            proxy_tcp_connection_data_forwarding(stream.clone(), outbound, destination).await
+            run_stream_operation(&stream, &session, &mut close_deadline,
+                proxy_tcp_connection_data_forwarding(stream.clone(), outbound, destination)).await
         }
     }.await;
 
@@ -146,9 +133,67 @@ async fn handle_proxy_stream(stream: Arc<Stream>, session: Arc<Session>) -> Resu
     {
         let error_frame =
             Frame::with_data(Command::SynAck, stream_id, Bytes::from(error.to_string()));
-        let _ = session.write_control_frame(error_frame).await;
+        let _ = finish_control_frame(&stream, &session, &mut close_deadline, error_frame).await;
     }
-    result
+    if stream.is_closed() && matches!(result, Err(AnyTlsError::SessionClosed)) {
+        Ok(())
+    } else {
+        result
+    }
+}
+
+/// Cancel only operations that do not write shared-session frames. All phases
+/// share the same one-second deadline after peer FIN; session shutdown wins
+/// immediately. A target that cannot drain cannot hold the stream indefinitely.
+async fn run_stream_operation<T>(
+    stream: &Stream,
+    session: &Session,
+    close_deadline: &mut Option<Instant>,
+    operation: impl Future<Output = Result<T>>,
+) -> Result<T> {
+    tokio::pin!(operation);
+    loop {
+        let deadline = *close_deadline;
+        tokio::select! {
+            biased;
+            _ = session.closed() => return Err(AnyTlsError::SessionClosed),
+            _ = stream.closed(), if deadline.is_none() => {
+                *close_deadline = Some(Instant::now() + Duration::from_secs(1));
+            }
+            _ = async {
+                match deadline {
+                    Some(deadline) => tokio::time::sleep_until(deadline).await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                tracing::debug!(stream_id = stream.id(), "Stream close drain timed out");
+                return Err(AnyTlsError::SessionClosed);
+            }
+            result = &mut operation => return result,
+        }
+    }
+}
+
+/// Record peer FIN without interrupting a frame already being written to the
+/// shared transport. Dropping a partially written SYNACK would corrupt every
+/// subsequent frame. The session's five-second control-write deadline applies.
+async fn finish_control_frame(
+    stream: &Stream,
+    session: &Session,
+    close_deadline: &mut Option<Instant>,
+    frame: Frame,
+) -> Result<()> {
+    let write = session.write_control_frame(frame);
+    tokio::pin!(write);
+    loop {
+        tokio::select! {
+            biased;
+            _ = stream.closed(), if close_deadline.is_none() => {
+                *close_deadline = Some(Instant::now() + Duration::from_secs(1));
+            }
+            result = &mut write => return result,
+        }
+    }
 }
 
 /// Start another address after 250ms, or immediately if all current attempts
@@ -377,7 +422,7 @@ async fn proxy_tcp_connection_data_forwarding(
         tokio::select! {
             biased;
             // Stop delivering responses after peer FIN, but drain the bytes that
-            // arrived before it. The outer handler bounds this by one second.
+            // arrived before it. The stream-operation deadline bounds the drain.
             _ = stream.closed() => to_outbound.await,
             result = &mut to_outbound => result,
             result = &mut to_client => result,
