@@ -1052,12 +1052,8 @@ impl Session {
                 buffer.len()
             );
             let mut writer = self.writer.lock().await;
-            if let Err(e) = writer.write_all(&buffer).await {
-                return Err(e);
-            }
-            if let Err(e) = writer.flush().await {
-                return Err(e);
-            }
+            writer.write_all(&buffer).await?;
+            writer.flush().await?;
             tracing::info!(
                 "[Session] write_with_padding: Successfully wrote {} bytes to connection",
                 buffer.len()
@@ -1080,12 +1076,8 @@ impl Session {
             // Note: We should probably disable send_padding, but that requires mutable access
             // For now, just write directly
             let mut writer = self.writer.lock().await;
-            if let Err(e) = writer.write_all(&buffer).await {
-                return Err(e);
-            }
-            if let Err(e) = writer.flush().await {
-                return Err(e);
-            }
+            writer.write_all(&buffer).await?;
+            writer.flush().await?;
             return Ok(());
         }
 
@@ -1095,12 +1087,8 @@ impl Session {
         // If no sizes defined, write directly
         if pkt_sizes.is_empty() {
             let mut writer = self.writer.lock().await;
-            if let Err(e) = writer.write_all(&buffer).await {
-                return Err(e);
-            }
-            if let Err(e) = writer.flush().await {
-                return Err(e);
-            }
+            writer.write_all(&buffer).await?;
+            writer.flush().await?;
             return Ok(());
         }
 
@@ -1141,9 +1129,7 @@ impl Session {
                         &buffer[..7]
                     );
                 }
-                if let Err(e) = writer.write_all(&buffer[..size]).await {
-                    return Err(e);
-                }
+                writer.write_all(&buffer[..size]).await?;
                 buffer = buffer.split_off(size);
             } else if remain_payload_len > 0 {
                 // This packet contains payload + padding
@@ -1162,9 +1148,7 @@ impl Session {
                     buffer.put_slice(&padding_frame);
                 }
 
-                if let Err(e) = writer.write_all(&buffer).await {
-                    return Err(e);
-                }
+                writer.write_all(&buffer).await?;
                 buffer.clear();
             } else {
                 // This packet is all padding
@@ -1174,9 +1158,7 @@ impl Session {
                 padding_frame.put_u16(size as u16);
                 padding_frame.put_slice(&vec![0u8; size]); // padding data (zeros)
 
-                if let Err(e) = writer.write_all(&padding_frame).await {
-                    return Err(e);
-                }
+                writer.write_all(&padding_frame).await?;
             }
         }
 
@@ -1186,15 +1168,11 @@ impl Session {
                 "[Session] write_with_padding: Writing {} remaining payload bytes",
                 buffer.len()
             );
-            if let Err(e) = writer.write_all(&buffer).await {
-                return Err(e);
-            }
+            writer.write_all(&buffer).await?;
         }
 
         tracing::trace!("[Session] write_with_padding: Flushing writer");
-        if let Err(e) = writer.flush().await {
-            return Err(e);
-        }
+        writer.flush().await?;
         tracing::debug!("[Session] write_with_padding: Successfully wrote and flushed data");
         Ok(())
     }

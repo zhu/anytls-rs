@@ -2,14 +2,16 @@
 
 use crate::protocol::{Command, Frame};
 use crate::session::{Session, Stream};
-use crate::util::{AnyTlsError, Result, configure_tcp_stream, resolve_host_with_cache};
+use crate::util::{AnyTlsError, Result, configure_tcp_stream, resolve_host_addresses_with_cache};
 use bytes::Bytes;
+use std::future::Future;
+use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio::time::{Duration, timeout};
+use tokio::task::JoinSet;
+use tokio::time::{Duration, Instant, timeout};
 
 /// Handler trait for processing new streams
 pub trait StreamHandler: Send + Sync {
@@ -46,56 +48,131 @@ impl StreamHandler for TcpProxyHandler {
         session: Arc<crate::session::Session>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>> {
         Box::pin(async move {
-            let stream_id = stream.id();
-            let peer_version = session.peer_version();
-            tracing::debug!(
-                "[Proxy] Handling stream {} (peer_version={})",
-                stream_id,
-                peer_version
-            );
-
-            // Read SOCKS5 address to determine the destination
-            let destination = match read_socks_addr(stream.clone()).await {
-                Ok(addr) => addr,
-                Err(e) => {
-                    tracing::error!("[Proxy] Failed to read SOCKS5 address: {}", e);
-                    return Err(e);
-                }
-            };
-
-            tracing::info!(
-                "[Proxy] Destination: {}:{}",
-                destination.addr,
-                destination.port
-            );
-
-            // Check if this is a UDP over TCP request
-            if destination.addr.contains("udp-over-tcp.arpa") {
-                tracing::debug!("[Proxy] Detected UDP over TCP request");
-                if peer_version >= 2 {
-                    tracing::debug!(
-                        "[Proxy] Sending SYNACK for UDP stream {} (connection established)",
-                        stream_id
-                    );
-                    let synack_frame = Frame::control(Command::SynAck, stream_id);
-                    if let Err(e) = session.write_control_frame(synack_frame).await {
-                        tracing::error!("[Proxy] Failed to send SYNACK: {}", e);
-                        return Err(e);
-                    }
-                }
-                crate::server::udp_proxy::handle_udp_over_tcp(stream).await
-            } else {
-                // Regular TCP proxy
-                proxy_tcp_connection_with_synack_internal(
-                    stream,
-                    session,
-                    stream_id,
-                    peer_version,
-                    destination,
-                )
-                .await
+            // FIN is queued behind all successfully queued data, including when
+            // the handler is cancelled. Remote FIN/session close suppresses it.
+            let _close = CloseStreamOnDrop(stream.clone());
+            tokio::select! {
+                biased;
+                _ = stream.closed() => Ok(()),
+                result = handle_proxy_stream(stream.clone(), session) => result,
             }
         })
+    }
+}
+
+struct CloseStreamOnDrop(Arc<Stream>);
+
+impl Drop for CloseStreamOnDrop {
+    fn drop(&mut self) {
+        self.0.close();
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum UotVersion {
+    Legacy,
+    V2,
+}
+
+fn uot_version(host: &str) -> Option<UotVersion> {
+    if host.eq_ignore_ascii_case("sp.v2.udp-over-tcp.arpa") {
+        Some(UotVersion::V2)
+    } else if host.eq_ignore_ascii_case("sp.udp-over-tcp.arpa") {
+        Some(UotVersion::Legacy)
+    } else {
+        None
+    }
+}
+
+async fn handle_proxy_stream(stream: Arc<Stream>, session: Arc<Session>) -> Result<()> {
+    let stream_id = stream.id();
+    let peer_version = session.peer_version();
+    let mut acknowledged = false;
+    let result = async {
+        let destination = timeout(Duration::from_secs(15), read_socks_addr(stream.clone()))
+            .await
+            .map_err(|_| AnyTlsError::Protocol("SOCKS address timeout (15s)".into()))??;
+        tracing::info!(stream_id, host = %destination.addr, port = destination.port, "Proxy destination");
+        if let Some(version) = uot_version(&destination.addr) {
+            if peer_version >= 2 {
+                session.write_control_frame(Frame::control(Command::SynAck, stream_id)).await?;
+            }
+            acknowledged = true;
+            match version {
+                UotVersion::Legacy => crate::server::udp_proxy::handle_udp_over_tcp_v1(stream.clone()).await,
+                UotVersion::V2 => crate::server::udp_proxy::handle_udp_over_tcp(stream.clone()).await,
+            }
+        } else {
+            // One deadline covers resolution and every fallback attempt.
+            let outbound = timeout(Duration::from_secs(15), async {
+                let addresses = resolve_host_addresses_with_cache(&destination.addr, destination.port).await?;
+                Ok::<_, AnyTlsError>(connect_candidates(addresses, TcpStream::connect).await?)
+            }).await.map_err(|_| AnyTlsError::Protocol(format!("Connection timeout (15s) to {}:{}", destination.addr, destination.port)))??;
+            configure_tcp_stream(&outbound, &format!("{}:{}", destination.addr, destination.port));
+            if peer_version >= 2 {
+                session.write_control_frame(Frame::control(Command::SynAck, stream_id)).await?;
+            }
+            acknowledged = true;
+            proxy_tcp_connection_data_forwarding(stream.clone(), outbound, destination).await
+        }
+    }.await;
+
+    // Parsing and DNS failures need the same v2 failure report as connect
+    // failures. After a success report, subsequent relay failures only close.
+    if let Err(error) = &result
+        && peer_version >= 2
+        && !acknowledged
+        && !stream.is_closed()
+        && !session.is_closed()
+    {
+        let error_frame =
+            Frame::with_data(Command::SynAck, stream_id, Bytes::from(error.to_string()));
+        let _ = session.write_control_frame(error_frame).await;
+    }
+    result
+}
+
+/// Start another address after 250ms, or immediately if all current attempts
+/// failed. The first success aborts and joins every losing attempt.
+async fn connect_candidates<F, Fut>(addresses: Vec<SocketAddr>, connect: F) -> io::Result<TcpStream>
+where
+    F: Fn(SocketAddr) -> Fut,
+    Fut: Future<Output = io::Result<TcpStream>> + Send + 'static,
+{
+    let mut addresses = addresses.into_iter();
+    let first = addresses
+        .next()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no destination addresses"))?;
+    let mut attempts = JoinSet::new();
+    attempts.spawn(connect(first));
+    let stagger = Duration::from_millis(250);
+    let delay = tokio::time::sleep(stagger);
+    tokio::pin!(delay);
+    loop {
+        tokio::select! {
+            result = attempts.join_next() => {
+                let error = match result.expect("at least one connect attempt") {
+                    Ok(Ok(stream)) => {
+                        attempts.shutdown().await;
+                        return Ok(stream);
+                    }
+                    Ok(Err(error)) => error,
+                    Err(error) => io::Error::other(error),
+                };
+                if attempts.is_empty() {
+                    if let Some(address) = addresses.next() {
+                        attempts.spawn(connect(address));
+                        delay.as_mut().reset(Instant::now() + stagger);
+                    } else {
+                        return Err(error);
+                    }
+                }
+            }
+            _ = &mut delay, if addresses.len() > 0 => {
+                attempts.spawn(connect(addresses.next().unwrap()));
+                delay.as_mut().reset(Instant::now() + stagger);
+            }
+        }
     }
 }
 
@@ -129,7 +206,7 @@ async fn read_socks_addr(stream: Arc<Stream>) -> Result<SocksAddr> {
     {
         let mut reader = reader_mutex.lock().await;
         reader
-            .read(&mut atyp_buf)
+            .read_exact(&mut atyp_buf)
             .await
             .map_err(|e| AnyTlsError::Protocol(format!("Failed to read address type: {}", e)))?;
     }
@@ -239,307 +316,146 @@ async fn read_socks_addr(stream: Arc<Stream>) -> Result<SocksAddr> {
     Ok(SocksAddr { addr, port })
 }
 
-/// Proxy TCP connection with SYNACK support (internal version with destination already provided)
-async fn proxy_tcp_connection_with_synack_internal(
-    stream: Arc<Stream>,
-    session: Arc<Session>,
-    stream_id: u32,
-    peer_version: u8,
-    destination: SocksAddr,
-) -> Result<()> {
-    tracing::debug!(
-        "[Proxy] proxy_tcp_connection_with_synack: Starting for stream {} (peer_version={})",
-        stream_id,
-        peer_version
-    );
-    tracing::debug!(
-        "[Proxy] Connecting to {}:{}",
-        destination.addr,
-        destination.port
-    );
-
-    let target_display = format!("{}:{}", destination.addr, destination.port);
-    let target_socket = if let Ok(ip) = destination.addr.parse::<IpAddr>() {
-        SocketAddr::new(ip, destination.port)
-    } else {
-        resolve_host_with_cache(&destination.addr, destination.port)
-            .await
-            .map_err(|err| {
-                tracing::error!(
-                    "[Proxy] DNS resolution failed for {}: {}",
-                    target_display,
-                    err
-                );
-                err
-            })?
-    };
-
-    // Create outbound TCP connection with timeout
-    // Default 15s timeout for DNS resolution + TCP handshake
-    // This prevents hanging on slow/unreachable targets
-    let connect_timeout = Duration::from_secs(15);
-    let outbound = match timeout(connect_timeout, TcpStream::connect(target_socket)).await {
-        Ok(Ok(conn)) => {
-            configure_tcp_stream(&conn, &target_display);
-            tracing::info!("[Proxy] Successfully connected to {}", target_display);
-            conn
-        }
-        Ok(Err(e)) => {
-            tracing::error!("[Proxy] Failed to connect to {}: {}", target_display, e);
-            // Send SYNACK with error if protocol version >= 2
-            // Note: All streams should receive SYNACK in protocol v2+, including stream_id=1
-            if peer_version >= 2 {
-                let error_msg = format!("Failed to connect to {}: {}", target_display, e);
-                let synack_frame =
-                    Frame::with_data(Command::SynAck, stream_id, Bytes::from(error_msg));
-                if let Err(send_err) = session.write_control_frame(synack_frame).await {
-                    tracing::error!("[Proxy] Failed to send SYNACK with error: {}", send_err);
-                }
-            }
-            return Err(AnyTlsError::Protocol(format!(
-                "Failed to connect to {}: {}",
-                target_display, e
-            )));
-        }
-        Err(_) => {
-            let error_msg = format!(
-                "Connection timeout ({}s) to {}",
-                connect_timeout.as_secs(),
-                target_display
-            );
-            tracing::error!("[Proxy] {}", error_msg);
-            // Send SYNACK with timeout error
-            if peer_version >= 2 {
-                let synack_frame =
-                    Frame::with_data(Command::SynAck, stream_id, Bytes::from(error_msg.clone()));
-                if let Err(send_err) = session.write_control_frame(synack_frame).await {
-                    tracing::error!("[Proxy] Failed to send SYNACK with error: {}", send_err);
-                }
-            }
-            return Err(AnyTlsError::Protocol(error_msg));
-        }
-    };
-
-    // Send SYNACK after successful connection (protocol v >= 2)
-    // Note: All streams should receive SYNACK in protocol v2+, including stream_id=1
-    // Similar to Go's ReportHandshakeSuccess - called after TCP connection is established
-    if peer_version >= 2 {
-        tracing::debug!(
-            "[Proxy] Sending SYNACK for stream {} (connection established)",
-            stream_id
-        );
-        let synack_frame = Frame::control(Command::SynAck, stream_id);
-        if let Err(e) = session.write_control_frame(synack_frame).await {
-            tracing::error!("[Proxy] Failed to send SYNACK: {}", e);
-            return Err(e);
-        }
-        tracing::debug!("[Proxy] SYNACK sent for stream {}", stream_id);
-    }
-
-    // Now forward data bidirectionally
-    tracing::debug!(
-        "[Proxy] proxy_tcp_connection_with_synack: Calling proxy_tcp_connection_data_forwarding for stream {}",
-        stream_id
-    );
-    proxy_tcp_connection_data_forwarding(stream, outbound, destination).await
-}
-
-/// Forward data between stream and outbound connection
-///
-/// 新实现：完全移除 Mutex 包装，直接使用 Stream
-/// Stream 内部的 reader 和 writer 已经分离，无锁竞争
+/// Relay both directions as scoped futures. Cancelling the handler drops both
+/// TCP halves; neither forwarding loop can outlive its stream.
 async fn proxy_tcp_connection_data_forwarding(
     stream: Arc<Stream>,
     outbound: TcpStream,
     destination: SocksAddr,
 ) -> Result<()> {
-    let stream_id = stream.id();
-    tracing::debug!(
-        "[Proxy] Starting data forwarding for stream {} to {}:{}",
-        stream_id,
-        destination.addr,
-        destination.port
-    );
-
-    // 分离 outbound 的读写
-    let (mut outbound_read, mut outbound_write) = tokio::io::split(outbound);
-
-    // ===== 关键改变：不再需要 Arc<Mutex<>> 包装！=====
-    // 直接克隆 Arc<Stream> 用于两个任务
-    let stream_for_read = Arc::clone(&stream);
-    let stream_for_write = Arc::clone(&stream);
-    let bytes_to_outbound = Arc::new(AtomicU64::new(0));
-    let bytes_to_client = Arc::new(AtomicU64::new(0));
-
-    // Task 1: Stream -> Outbound（从 stream 读取，写入 outbound）
-    tracing::debug!(
-        "[Proxy] Spawning Task1 (stream->outbound) for stream {}",
-        stream_id
-    );
-    let bytes_to_outbound_clone = Arc::clone(&bytes_to_outbound);
-    let task1 = tokio::spawn(async move {
-        tracing::debug!("[Proxy-Task1] Task started for stream {}", stream_id);
-
-        // 获取 reader 的引用（无需锁整个 stream）
-        let reader_mutex = stream_for_read.reader();
-        let mut buf = vec![0u8; 8192];
-        let mut iteration = 0u64;
-
+    let (mut outbound_read, mut outbound_write) = outbound.into_split();
+    let mut bytes_to_outbound = 0u64;
+    let mut bytes_to_client = 0u64;
+    let to_outbound = async {
+        let mut reader = stream.reader().lock().await;
+        let mut buffer = [0; 8192];
         loop {
-            iteration += 1;
-
-            // 获取 reader 的锁并读取
-            // 注意：锁只在读取时持有，不影响 Task2 的写入
-            let n = {
-                let mut reader = reader_mutex.lock().await;
-                match reader.read(&mut buf).await {
-                    Ok(0) => {
-                        tracing::debug!(
-                            "[Proxy-Task1] Stream EOF (stream_id={}, iteration={})",
-                            stream_id,
-                            iteration
-                        );
-                        break;
-                    }
-                    Ok(n) => {
-                        tracing::debug!(
-                            "[Proxy-Task1] Read {} bytes from stream {} (iteration={})",
-                            n,
-                            stream_id,
-                            iteration
-                        );
-                        n
-                    }
-                    Err(e) => {
-                        tracing::error!(
-                            "[Proxy-Task1] Stream read error (stream_id={}, iteration={}): {}",
-                            stream_id,
-                            iteration,
-                            e
-                        );
-                        break;
-                    }
-                }
-            }; // reader 锁在这里释放
-
-            // 写入 outbound（无锁）
-            if let Err(e) = outbound_write.write_all(&buf[..n]).await {
-                tracing::error!("[Proxy-Task1] Outbound write error: {}", e);
-                break;
+            let n = reader.read(&mut buffer).await?;
+            if n == 0 {
+                return Ok::<_, AnyTlsError>(());
             }
-            bytes_to_outbound_clone.fetch_add(n as u64, Ordering::Relaxed);
-
-            tracing::trace!(
-                "[Proxy-Task1] Forwarded {} bytes to outbound (iteration={})",
-                n,
-                iteration
-            );
+            outbound_write.write_all(&buffer[..n]).await?;
+            bytes_to_outbound += n as u64;
         }
-
-        tracing::debug!(
-            "[Proxy-Task1] Task completed for stream {} after {} iterations",
-            stream_id,
-            iteration
-        );
-    });
-
-    // Task 2: Outbound -> Stream（从 outbound 读取，写入 stream）
-    tracing::debug!(
-        "[Proxy] Spawning Task2 (outbound->stream) for stream {}",
-        stream_id
-    );
-    let bytes_to_client_clone = Arc::clone(&bytes_to_client);
-    let task2 = tokio::spawn(async move {
-        tracing::debug!("[Proxy-Task2] Task started for stream {}", stream_id);
-        let mut buf = vec![0u8; 8192];
-        let mut iteration = 0u64;
-
+    };
+    let to_client = async {
+        let mut buffer = [0; 8192];
         loop {
-            iteration += 1;
-
-            // 从 outbound 读取（无锁）
-            let n = match outbound_read.read(&mut buf).await {
-                Ok(0) => {
-                    tracing::debug!(
-                        "[Proxy-Task2] Outbound EOF (stream_id={}, iteration={})",
-                        stream_id,
-                        iteration
-                    );
-                    break;
-                }
-                Ok(n) => {
-                    tracing::debug!(
-                        "[Proxy-Task2] Read {} bytes from outbound (iteration={})",
-                        n,
-                        iteration
-                    );
-                    n
-                }
-                Err(e) => {
-                    tracing::error!("[Proxy-Task2] Outbound read error: {}", e);
-                    break;
-                }
-            };
-
-            // 写入 stream（使用 send_data，完全无锁！）
-            use bytes::Bytes;
-            if let Err(e) = stream_for_write
-                .send_data(Bytes::copy_from_slice(&buf[..n]))
+            let n = outbound_read.read(&mut buffer).await?;
+            if n == 0 {
+                return Ok::<_, AnyTlsError>(());
+            }
+            stream
+                .send_data(Bytes::copy_from_slice(&buffer[..n]))
                 .await
-            {
-                tracing::error!(
-                    "[Proxy-Task2] Stream write error (stream_id={}, iteration={}): {:?}",
-                    stream_id,
-                    iteration,
-                    e
-                );
-                break;
-            }
-            bytes_to_client_clone.fetch_add(n as u64, Ordering::Relaxed);
-
-            tracing::trace!(
-                "[Proxy-Task2] Wrote {} bytes to stream {} (iteration={})",
-                n,
-                stream_id,
-                iteration
-            );
+                .map_err(|_| AnyTlsError::SessionClosed)?;
+            bytes_to_client += n as u64;
         }
+    };
+    let result = tokio::select! {
+        result = to_outbound => result,
+        result = to_client => result,
+    };
+    tracing::debug!(stream_id = stream.id(), host = %destination.addr,
+        port = destination.port, bytes_to_outbound, bytes_to_client, "Proxy connection closed");
+    result
+}
 
-        tracing::debug!(
-            "[Proxy-Task2] Task completed for stream {} after {} iterations",
-            stream_id,
-            iteration
-        );
-    });
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::session::StreamReader;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use tokio::net::{TcpListener, TcpSocket};
+    use tokio::sync::mpsc;
 
-    // Tear down as soon as EITHER direction finishes. Previously this waited
-    // for BOTH tasks (`join!`): when the client closed its stream (FIN), task1
-    // hit stream-EOF and exited, but task2 stayed blocked reading the still-open
-    // target, so `join!` never returned and the outbound TCP socket (its fd)
-    // leaked for the life of the process — one per proxied stream. Cancelling
-    // the surviving half drops its socket end and closes the target connection.
-    tracing::debug!(
-        "[Proxy] Waiting for either task to complete for stream {}",
-        stream_id
-    );
-    let mut task1 = task1;
-    let mut task2 = task2;
-    tokio::select! {
-        _ = &mut task1 => { task2.abort(); }
-        _ = &mut task2 => { task1.abort(); }
+    #[tokio::test]
+    async fn missing_and_truncated_socks_addresses_report_eof() {
+        for bytes in [Bytes::new(), Bytes::from_static(&[1, 127, 0])] {
+            let (data_tx, data_rx) = mpsc::channel(1);
+            if !bytes.is_empty() {
+                data_tx.send(bytes).await.unwrap();
+            }
+            drop(data_tx);
+            let (writer, _receiver) = mpsc::channel(1);
+            let (stream, _) = Stream::new(1, StreamReader::new(1, data_rx), writer);
+            let error = timeout(Duration::from_secs(1), read_socks_addr(Arc::new(stream)))
+                .await
+                .unwrap()
+                .unwrap_err();
+            assert!(error.to_string().contains("Failed to read"));
+            assert!(!error.to_string().contains("Unsupported address type"));
+        }
     }
-    let outbound_bytes = bytes_to_outbound.load(Ordering::Relaxed);
-    let client_bytes = bytes_to_client.load(Ordering::Relaxed);
 
-    tracing::debug!(
-        stream_id = stream_id,
-        bytes_outbound = outbound_bytes,
-        bytes_client = client_bytes,
-        "[Proxy] Connection closed for stream {} to {}:{}",
-        stream_id,
-        destination.addr,
-        destination.port
-    );
+    #[test]
+    fn udp_magic_names_require_exact_hosts() {
+        assert_eq!(uot_version("sp.v2.udp-over-tcp.arpa"), Some(UotVersion::V2));
+        assert_eq!(
+            uot_version("SP.UDP-OVER-TCP.ARPA"),
+            Some(UotVersion::Legacy)
+        );
+        for host in [
+            "udp-over-tcp.arpa",
+            "sp.v2.udp-over-tcp.arpa.example",
+            "prefix-sp.v2.udp-over-tcp.arpa",
+        ] {
+            assert_eq!(uot_version(host), None);
+        }
+    }
 
-    Ok(())
+    #[tokio::test]
+    async fn connection_tries_next_address_after_refusal() {
+        let refused = TcpSocket::new_v4().unwrap();
+        refused.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = target.local_addr().unwrap();
+        let stream = timeout(
+            Duration::from_secs(2),
+            connect_candidates(
+                vec![refused.local_addr().unwrap(), address],
+                TcpStream::connect,
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(stream.peer_addr().unwrap(), address);
+    }
+
+    #[tokio::test]
+    async fn stalled_first_address_does_not_block_later_address() {
+        struct Cancelled(Arc<AtomicBool>);
+        impl Drop for Cancelled {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = target.local_addr().unwrap();
+        let stalled: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let stream = timeout(
+            Duration::from_secs(2),
+            connect_candidates(vec![stalled, address], |candidate| {
+                let cancelled = cancelled.clone();
+                async move {
+                    if candidate == stalled {
+                        let _cancelled = Cancelled(cancelled);
+                        std::future::pending().await
+                    } else {
+                        TcpStream::connect(candidate).await
+                    }
+                }
+            }),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(stream.peer_addr().unwrap(), address);
+        assert!(
+            cancelled.load(Ordering::SeqCst),
+            "losing connect attempt must be joined"
+        );
+    }
 }
