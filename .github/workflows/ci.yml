@@ -6,6 +6,10 @@ on:
   pull_request:
     branches: [ main, develop ]
 
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -72,6 +76,7 @@ jobs:
   benchmark-quick:
     name: Benchmark (Quick Check)
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     steps:
       - uses: actions/checkout@v4
@@ -94,14 +99,15 @@ jobs:
           restore-keys: |
             ubuntu-cargo-bench-quick-
       
+      - name: Build benchmark fixtures
+        run: cargo bench --locked --no-run --bench session_bench --bench stream_bench --bench e2e_bench
+
       - name: Quick benchmark validation
+        timeout-minutes: 4
         run: |
-          echo "⚠️ This is a quick validation. Full benchmarks run in benchmark.yml workflow."
-          echo "Running quick test mode benchmarks..."
           for bench in session_bench stream_bench e2e_bench; do
-            cargo bench --bench $bench -- --test || true
+            timeout 60s cargo bench --locked --bench "$bench" -- --test
           done
-          echo "✅ Quick benchmark validation passed"
 
   security:
     name: Security Audit
