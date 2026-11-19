@@ -1,4 +1,4 @@
-use crate::protocol::frame::{Command, Frame, HEADER_OVERHEAD_SIZE};
+use crate::protocol::frame::{Command, Frame, HEADER_OVERHEAD_SIZE, MAX_FRAME_PAYLOAD_SIZE};
 use bytes::{BufMut, Bytes, BytesMut};
 use std::io;
 use tokio_util::codec::{Decoder, Encoder};
@@ -97,6 +97,12 @@ impl Encoder<Frame> for FrameCodec {
 
     fn encode(&mut self, item: Frame, dst: &mut BytesMut) -> Result<(), Self::Error> {
         let data_len = item.data.len();
+        if data_len > MAX_FRAME_PAYLOAD_SIZE {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "frame payload exceeds 65535 bytes",
+            ));
+        }
 
         // Reserve space: header + data
         dst.reserve(HEADER_OVERHEAD_SIZE + data_len);

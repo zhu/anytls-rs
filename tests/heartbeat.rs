@@ -201,6 +201,14 @@ async fn test_heartbeat_with_active_stream() {
 
     // Open a stream
     tracing::info!("Opening stream...");
+    client_session
+        .write_control_frame(Frame::with_data(
+            Command::Settings,
+            0,
+            bytes::Bytes::from_static(b"v=2"),
+        ))
+        .await
+        .unwrap();
     let (_stream, _synack_rx) = client_session.open_stream().await.unwrap();
 
     tokio::time::sleep(Duration::from_millis(100)).await;

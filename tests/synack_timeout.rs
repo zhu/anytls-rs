@@ -52,6 +52,14 @@ async fn test_synack_success() {
     // Open a stream (should receive SYNACK)
     // Note: For stream_id >= 2, server will send SYNACK after handler processes
     // For stream_id = 1, server may not send SYNACK in current implementation
+    client_session
+        .write_control_frame(Frame::with_data(
+            Command::Settings,
+            0,
+            Bytes::from_static(b"v=2"),
+        ))
+        .await
+        .unwrap();
     let (stream, synack_rx) = client_session.open_stream().await.unwrap();
     let stream_id = stream.id();
 
@@ -117,6 +125,14 @@ async fn test_synack_timeout() {
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     // Open a stream (SYN will be sent, but no SYNACK will come)
+    client_session
+        .write_control_frame(Frame::with_data(
+            Command::Settings,
+            0,
+            Bytes::from_static(b"v=2"),
+        ))
+        .await
+        .unwrap();
     let (stream, synack_rx) = client_session.open_stream().await.unwrap();
 
     // Wait for SYNACK with short timeout (should timeout)
@@ -179,6 +195,14 @@ async fn test_synack_error_message() {
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     // Open a stream
+    client_session
+        .write_control_frame(Frame::with_data(
+            Command::Settings,
+            0,
+            Bytes::from_static(b"v=2"),
+        ))
+        .await
+        .unwrap();
     let (stream, synack_rx) = client_session.open_stream().await.unwrap();
     let stream_id = stream.id();
 

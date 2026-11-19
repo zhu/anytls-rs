@@ -1,7 +1,7 @@
 //! Session implementation for AnyTLS protocol
 
 use crate::padding::PaddingFactory;
-use crate::protocol::{Command, Frame, FrameCodec};
+use crate::protocol::{Command, Frame, FrameCodec, MAX_FRAME_PAYLOAD_SIZE};
 use crate::session::{STREAM_CHANNEL_CAPACITY, Stream};
 use crate::util::{AnyTlsError, Result, StringMap};
 use bytes::{Bytes, BytesMut};
@@ -54,6 +54,8 @@ pub struct Session {
 
     // Session state
     is_closed: Arc<std::sync::atomic::AtomicBool>,
+    received_settings: std::sync::atomic::AtomicBool,
+    last_peer_stream_id: std::sync::atomic::AtomicU32,
 
     // Padding factory (wrapped in Arc for potential updates)
     padding: Arc<RwLock<Arc<PaddingFactory>>>,
@@ -135,6 +137,8 @@ impl Session {
             stream_data_rx: Arc::new(tokio::sync::Mutex::new(Some(stream_data_rx))),
             stream_receive_tx: Arc::new(RwLock::new(HashMap::new())),
             is_closed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            received_settings: std::sync::atomic::AtomicBool::new(false),
+            last_peer_stream_id: std::sync::atomic::AtomicU32::new(0),
             padding: Arc::new(RwLock::new(padding)),
             is_client: true,
             send_padding: true,
@@ -169,6 +173,8 @@ impl Session {
             stream_data_rx: Arc::new(tokio::sync::Mutex::new(Some(stream_data_rx))),
             stream_receive_tx: Arc::new(RwLock::new(HashMap::new())),
             is_closed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            received_settings: std::sync::atomic::AtomicBool::new(false),
+            last_peer_stream_id: std::sync::atomic::AtomicU32::new(0),
             padding: Arc::new(RwLock::new(padding)),
             is_client: false,
             send_padding: false,
@@ -445,6 +451,10 @@ impl Session {
         );
         match frame.cmd {
             Command::Push => {
+                // A zero-length PSH carries no stream data; only FIN is EOF.
+                if frame.data.is_empty() {
+                    return Ok(());
+                }
                 // Data frame - forward to stream
                 let data_len = frame.data.len();
                 tracing::debug!(
@@ -535,6 +545,26 @@ impl Session {
                 // Stream open (server side)
                 if !self.is_client {
                     let stream_id = frame.stream_id;
+                    if !self
+                        .received_settings
+                        .load(std::sync::atomic::Ordering::Acquire)
+                    {
+                        return self
+                            .reject_protocol("client did not send its settings")
+                            .await;
+                    }
+                    let last_id = self
+                        .last_peer_stream_id
+                        .load(std::sync::atomic::Ordering::Relaxed);
+                    if stream_id == 0 || stream_id <= last_id {
+                        return self
+                            .reject_protocol(
+                                "stream IDs must be nonzero and monotonically increasing",
+                            )
+                            .await;
+                    }
+                    self.last_peer_stream_id
+                        .store(stream_id, std::sync::atomic::Ordering::Relaxed);
                     tracing::debug!(
                         session_id = session_id,
                         "[Session] Received SYN for stream {} (server side)",
@@ -660,6 +690,8 @@ impl Session {
             Command::Settings => {
                 // Client settings (server side)
                 if !self.is_client && !frame.data.is_empty() {
+                    self.received_settings
+                        .store(true, std::sync::atomic::Ordering::Release);
                     let settings = StringMap::from_bytes(&frame.data);
 
                     // Check padding-md5
@@ -840,6 +872,17 @@ impl Session {
         Ok((stream, synack_rx))
     }
 
+    async fn reject_protocol(&self, reason: &str) -> Result<()> {
+        let _ = self
+            .write_control_frame(Frame::with_data(
+                Command::Alert,
+                0,
+                Bytes::copy_from_slice(reason.as_bytes()),
+            ))
+            .await;
+        Err(AnyTlsError::Protocol(reason.to_owned()))
+    }
+
     async fn register_stream(
         &self,
         stream_id: u32,
@@ -875,8 +918,14 @@ impl Session {
             stream_id,
             data.len()
         );
-        let frame = Frame::data(stream_id, data);
-        self.write_frame(frame).await
+        // Larger application writes must become several complete PSH frames;
+        // truncating the length field would desynchronize the entire session.
+        let mut remaining = data;
+        while !remaining.is_empty() {
+            let chunk = remaining.split_to(remaining.len().min(MAX_FRAME_PAYLOAD_SIZE));
+            self.write_frame(Frame::data(stream_id, chunk)).await?;
+        }
+        Ok(())
     }
 
     /// Write a control frame to connection
