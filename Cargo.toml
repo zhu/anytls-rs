@@ -1,13 +1,13 @@
 [package]
 name = "anytls-rs"
-version = "0.5.4"
+version = "0.5.4-custom.2"
 edition = "2024"
 authors = ["Mickey <mickey@jxo.me>"]
 description = "Async TLS proxy with SOCKS5 support for privacy and security."
 license = "MIT"
-repository = "https://github.com/jxo-me/anytls-rs"
-homepage = "https://github.com/jxo-me/anytls-rs"
-documentation = "https://docs.rs/anytls-rs"
+repository = "https://github.com/zhu/anytls-rs"
+documentation = "https://github.com/zhu/anytls-rs/blob/main/docs/SERVER_COMPATIBILITY.md"
+publish = false
 keywords = ["anytls", "tls", "proxy", "socks5", "security"]
 categories = ["network-programming", "cryptography", "asynchronous"]
 readme = "README.md"

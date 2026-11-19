@@ -1,21 +1,23 @@
 # AnyTLS-RS
 
-[![Version](https://img.shields.io/badge/version-0.5.2-blue.svg)](https://github.com/jxo-me/anytls-rs)
-[![Rust](https://img.shields.io/badge/rust-1.70+-orange.svg)](https://www.rust-lang.org)
+[![Version](https://img.shields.io/badge/version-custom--v0.5.4.2-blue.svg)](https://github.com/zhu/anytls-rs)
+[![Rust](https://img.shields.io/badge/rust-stable-orange.svg)](https://www.rust-lang.org)
 [![Edition](https://img.shields.io/badge/edition-2024-blue.svg)](https://doc.rust-lang.org/edition-guide/)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
-高性能、可观测的 AnyTLS 协议 Rust 实现，专注缓解 TLS-in-TLS 指纹识别问题，支持 sing-box outbound ⇄ anytls-rs 服务端的端到端集成。支持 TLS 证书热重载、灵活的日志控制，适合生产环境部署。
+AnyTLS 协议的异步 Rust 实现，包含客户端和服务端。这个 fork 的 custom 版本重点维护服务端与 dae、AnyTLS 参考实现的互通，支持 TLS 证书热重载与日志控制。
 
 [English Version](README.en.md)
 
 ---
 
+> **Custom 服务端版本：`custom-v0.5.4.2`**（二进制版本 `0.5.4-custom.2`）。本版本针对 Rust 服务端与 dae / AnyTLS 参考客户端的互通修复；Shadowrocket 尚未进行 iOS 实机验证。部署限制、测试范围与固定客户端源码见[服务端兼容性说明](docs/SERVER_COMPATIBILITY.md)，下载见 [Releases](https://github.com/zhu/anytls-rs/releases/tag/custom-v0.5.4.2)。
+
 ## ✨ 核心特性
 
 - **多协议代理**：内置 SOCKS5 代理，新增 HTTP CONNECT/明文代理 (`anytls-client -H/--http-listen`)
 - **会话复用**：session pool 支持自定义空闲检查/超时/预热（`-I/-T/-M` 与环境变量映射）
-- **UDP-over-TCP**：兼容 sing-box v1.2 行为，自动发送 SYNACK，支持回环集成测试
+- **UDP-over-TCP**：服务端支持 UoT v1 与 v2、connect 与逐包寻址模式、IPv4 / IPv6，覆盖真实客户端回环互通测试
 - **TLS 证书热重载** ⭐：
   - 文件监听自动重载（`--watch-cert`）
   - SIGHUP 信号手动触发（Unix/Linux/macOS）
@@ -24,7 +26,7 @@
   - 详细证书信息展示（`--show-cert-info`）
 - **灵活日志控制** ⭐：
   - 运行时可配置日志级别（`-L/--log-level`）
-  - 优化的日志分层（info 只记录连接级事件，生产环境日志减少 70-80%）
+  - 按日志级别查看连接事件与协议细节
   - Debug/Trace 级别提供详细排查信息
 - **TLS 管理**：可加载 PEM 证书，也可自动生成 `anytls.local` 自签证书（脚本自动完成）
 - **脚本与自动化**：`scripts/dev-up.sh` 与 `scripts/dev-verify.sh` 提供最短启动与校验
@@ -37,7 +39,7 @@
 
 ### 1. 环境要求
 
-- Rust 1.70+ / cargo（推荐使用 rustup）
+- Rust stable / cargo（推荐使用 rustup）
 - 可选：`openssl`（如需导入现有证书）
 - macOS/Linux 需允许脚本执行权限：`chmod +x scripts/*.sh`
 

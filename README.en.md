@@ -1,21 +1,23 @@
 # AnyTLS-RS
 
-[![Version](https://img.shields.io/badge/version-0.5.2-blue.svg)](https://github.com/jxo-me/anytls-rs)
-[![Rust](https://img.shields.io/badge/rust-1.70+-orange.svg)](https://www.rust-lang.org)
+[![Version](https://img.shields.io/badge/version-custom--v0.5.4.2-blue.svg)](https://github.com/zhu/anytls-rs)
+[![Rust](https://img.shields.io/badge/rust-stable-orange.svg)](https://www.rust-lang.org)
 [![Edition](https://img.shields.io/badge/edition-2024-blue.svg)](https://doc.rust-lang.org/edition-guide/)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
-High-performance and observable AnyTLS implementation in Rust, designed to mitigate TLS-in-TLS fingerprinting and interoperate with sing-box outbound → anytls-rs server setups. Features TLS certificate hot-reloading and flexible logging control, ready for production deployment.
+An asynchronous Rust implementation of AnyTLS, including a client and server. This fork's custom releases focus on server interoperability with dae and the AnyTLS reference implementation, with TLS certificate hot-reloading and configurable logging.
 
 [中文版](README.md)
 
 ---
 
+> **Custom server release: `custom-v0.5.4.2`** (binary version `0.5.4-custom.2`). This release fixes Rust server interoperability with dae and the AnyTLS reference client. Shadowrocket has not been tested on an iOS device. See [server compatibility notes](docs/SERVER_COMPATIBILITY.md) for limits and pinned test clients, and [Releases](https://github.com/zhu/anytls-rs/releases/tag/custom-v0.5.4.2) for downloads.
+
 ## ✨ Highlights
 
 - **Multi-protocol proxy**: built-in SOCKS5 plus new HTTP CONNECT/plain proxy (`anytls-client -H/--http-listen`)
 - **Session pooling**: configurable idle check/timeout/warm-up via short flags (`-I/-T/-M`) and env vars
-- **UDP-over-TCP**: interoperable with sing-box v1.2, sends SYNACK immediately, covered by loopback tests
+- **UDP-over-TCP**: server support for UoT v1/v2, connected and per-packet addressing, IPv4/IPv6, with real-client loopback tests
 - **TLS Certificate Hot-Reloading** ⭐:
   - File watching for automatic reload (`--watch-cert`)
   - SIGHUP signal for manual trigger (Unix/Linux/macOS)
@@ -24,7 +26,7 @@ High-performance and observable AnyTLS implementation in Rust, designed to mitig
   - Detailed certificate info display (`--show-cert-info`)
 - **Flexible Logging Control** ⭐:
   - Runtime-configurable log levels (`-L/--log-level`)
-  - Optimized log layering (info for connection events only, 70-80% less logs in production)
+  - Configurable visibility into connection events and protocol details
   - Debug/Trace levels for detailed troubleshooting
 - **TLS management**: load existing PEM certs or auto-generate `anytls.local` self-signed pair (scripts handle it)
 - **Automation**: `scripts/dev-up.sh` for the fastest spin-up, `scripts/dev-verify.sh` for local regression
@@ -37,7 +39,7 @@ High-performance and observable AnyTLS implementation in Rust, designed to mitig
 
 ### 1. Requirements
 
-- Rust 1.70+ / cargo (Rustup recommended)
+- Rust stable / cargo (Rustup recommended)
 - Optional: `openssl` when importing external certificates
 - macOS/Linux: ensure scripts are executable (`chmod +x scripts/*.sh`)
 

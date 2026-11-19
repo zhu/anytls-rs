@@ -16,6 +16,7 @@ env:
 jobs:
   publish:
     name: Publish to crates.io
+    if: github.repository == 'jxo-me/anytls-rs' && (github.event_name != 'release' || !startsWith(github.event.release.tag_name, 'custom-'))
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

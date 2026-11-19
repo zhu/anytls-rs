@@ -2,6 +2,21 @@
 
 All notable changes to this project will be documented in this file. Dates use `YYYY-MM-DD`.
 
+## [custom-v0.5.4.2] - 2026-11-19
+
+### Fixed
+- Rust server DNS port isolation and multiple-address TCP fallback.
+- Session cancellation, write-error deadlocks, stream FIN/EOF/error cleanup, and task ownership.
+- UoT v2 connected/unconnected modes, legacy v1, IPv6, empty datagrams, and large-frame fragmentation.
+- Settings/SYN ordering, stream ID validation, exact UoT magic domains, and live certificate expiry monitoring.
+
+### Added
+- Configurable live-connection limit and combined TLS/authentication deadline.
+- Pinned real dae and anytls-go interoperability fixtures, run in CI and before release publication.
+- Custom version metadata and guarded manual release workflow; custom releases are not published to crates.io.
+
+See [release notes](RELEASE_NOTES_custom-v0.5.4.2.md) and [compatibility scope](SERVER_COMPATIBILITY.md).
+
 ## [0.5.4] - 2025-11-11
 
 ### Added

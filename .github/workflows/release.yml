@@ -2,22 +2,89 @@ name: Release
 
 on:
   push:
-    tags:
-      - 'v*'
-      - 'custom-v*'
+    tags: ['v*', 'custom-v*']
   workflow_dispatch:
     inputs:
       version:
-        description: 'Version tag (e.g., custom-v0.3.0)'
+        description: 'Release tag (e.g., custom-v0.5.4.2)'
         required: true
         type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ inputs.version || github.ref_name }}
+  cancel-in-progress: false
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  prepare:
+    name: Validate release tag
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
+      archive_version: ${{ steps.version.outputs.archive_version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: version
+        env:
+          RELEASE_TAG: ${{ inputs.version || github.ref_name }}
+        run: |
+          python3 - <<'PYTHON'
+          import os, re, subprocess, tomllib
+          tag = os.environ['RELEASE_TAG']
+          custom = re.fullmatch(r'custom-v(\d+\.\d+\.\d+)\.(\d+)', tag)
+          standard = re.fullmatch(r'v(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)', tag)
+          if custom:
+              expected = custom[1] + '-custom.' + custom[2]
+          elif standard:
+              expected = standard[1]
+          else:
+              raise SystemExit('Invalid release tag')
+          with open('Cargo.toml', 'rb') as source:
+              actual = tomllib.load(source)['package']['version']
+          if actual != expected:
+              raise SystemExit(f'Tag expects Cargo version {expected}, found {actual}')
+          existing = subprocess.run(['git', 'rev-parse', '--verify', f'refs/tags/{tag}^{{commit}}'], text=True, capture_output=True)
+          if existing.returncode == 0 and existing.stdout.strip() != os.environ['GITHUB_SHA']:
+              raise SystemExit('Existing tag points to another commit; refusing to replace its assets')
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              output.write(f'tag={tag}\narchive_version={tag.removeprefix("v")}\n')
+          PYTHON
+
+  verify:
+    name: Verify release and real Go clients
+    needs: prepare
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.24.x'
+          cache-dependency-path: tests/interop/*/go.sum
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --check
+      - run: cargo clippy --locked --all-targets --all-features -- -D warnings
+      - run: cargo test --locked --all-features
+      - run: cargo build --locked --bin anytls-server
+      - name: Test dae transport and anytls-go reference
+        run: |
+          SERVER_BINARY="$GITHUB_WORKSPACE/target/debug/anytls-server"
+          for client in dae reference; do
+            (cd "tests/interop/$client" && go run -mod=readonly -buildvcs=false . -server-binary "$SERVER_BINARY")
+          done
+
   build:
     name: Build Release - ${{ matrix.os }} (${{ matrix.arch }})
+    needs: prepare
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -138,25 +205,25 @@ jobs:
       
       - name: Build release binaries
         run: |
-          cargo build --release --verbose --target ${{ matrix.target }} --bin anytls-client --bin anytls-server
+          cargo build --locked --release --verbose --target ${{ matrix.target }} --bin anytls-client --bin anytls-server
       
       - name: Create release archive
         shell: bash
+        env:
+          ARCHIVE_VERSION: ${{ needs.prepare.outputs.archive_version }}
         run: |
-          VERSION=${GITHUB_REF_NAME#v}
-          if [ -z "$VERSION" ] && [ -n "${{ github.event.inputs.version }}" ]; then
-            VERSION=${{ github.event.inputs.version }}
-          fi
-          VERSION=${VERSION#v}
+          VERSION="$ARCHIVE_VERSION"
           ARTIFACT_NAME="${{ matrix.artifact_name }}-${VERSION}"
           ARTIFACT_DIR="release"
           mkdir -p "${ARTIFACT_DIR}"
           cp LICENSE README.md README.en.md "${ARTIFACT_DIR}/"
+          mkdir -p "${ARTIFACT_DIR}/docs"
+          cp docs/SERVER_COMPATIBILITY.md "${ARTIFACT_DIR}/docs/"
           if [ -f docs/CHANGELOG.md ]; then
-            cp docs/CHANGELOG.md "${ARTIFACT_DIR}/"
+            cp docs/CHANGELOG.md "${ARTIFACT_DIR}/docs/"
           fi
           if ls docs/RELEASE_NOTES_*.md >/dev/null 2>&1; then
-            cp docs/RELEASE_NOTES_*.md "${ARTIFACT_DIR}/"
+            cp docs/RELEASE_NOTES_*.md "${ARTIFACT_DIR}/docs/"
           fi
           
           if [ "${{ matrix.archive_ext }}" == "zip" ]; then
@@ -179,230 +246,84 @@ jobs:
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.artifact_name }}-${{ github.ref_name }}
+          name: ${{ matrix.artifact_name }}-${{ needs.prepare.outputs.tag }}
           path: |
             ${{ env.ARTIFACT_PATH }}
           if-no-files-found: error
           retention-days: 90
 
   checksum:
-    name: Generate Release Checksums
-    needs: build
+    name: Generate release checksums
+    needs: [prepare, build]
     runs-on: ubuntu-latest
     steps:
-      - name: Download all artifacts
-        uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v4
         with:
           path: artifacts
-          pattern: anytls-*-${{ github.ref_name }}
+          pattern: anytls-*-${{ needs.prepare.outputs.tag }}
           merge-multiple: true
-      
       - name: Generate checksums
+        working-directory: artifacts
         run: |
-          cd artifacts
-          find . -type f \( -name "*.tar.gz" -o -name "*.zip" \) ! -name "*.sha256" | while read file; do
-            if [[ "$file" == *.zip ]]; then
-              # Windows - use PowerShell if available, otherwise use certutil
-              if command -v powershell &> /dev/null; then
-                powershell -Command "(Get-FileHash $file -Algorithm SHA256).Hash | Out-File -Encoding utf8 ${file}.sha256"
-              else
-                sha256sum "$file" > "${file}.sha256"
-              fi
-            else
-              sha256sum "$file" > "${file}.sha256"
-            fi
+          for archive in *.tar.gz *.zip; do
+            [ -f "$archive" ] || continue
+            sha256sum "$archive" > "$archive.sha256"
           done
-      
-      - name: Upload checksums
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
-          name: checksums-${{ github.ref_name }}
+          name: checksums-${{ needs.prepare.outputs.tag }}
           path: artifacts/*.sha256
+          if-no-files-found: error
           retention-days: 90
 
-  publish:
-    name: Publish to crates.io
-    needs: build
-    runs-on: ubuntu-latest
-    if: false
-    permissions:
-      contents: read
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-      
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
-      
-      - name: Cache cargo registry
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/bin/
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-            target/
-          key: ubuntu-cargo-publish-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ubuntu-cargo-publish-
-      
-      - name: Verify package metadata
-        run: |
-          cargo package --list
-          cargo package
-      
-      - name: Check version matches tag
-        run: |
-          VERSION=$(grep '^version =' Cargo.toml | sed 's/version = "\(.*\)"/\1/')
-          TAG_VERSION=${GITHUB_REF#refs/tags/v}
-          if [ "$VERSION" != "$TAG_VERSION" ]; then
-            echo "❌ Error: Cargo.toml version ($VERSION) does not match tag version ($TAG_VERSION)"
-            exit 1
-          fi
-          echo "✅ Version matches: $VERSION"
-      
-      - name: Publish to crates.io
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-        run: |
-          if [ -z "$CARGO_REGISTRY_TOKEN" ]; then
-            echo "❌ Error: CARGO_REGISTRY_TOKEN secret is not set"
-            echo "Please set it in GitHub Secrets: Settings -> Secrets and variables -> Actions"
-            echo "Get token from: https://crates.io/settings/tokens"
-            exit 1
-          fi
-          echo "🚀 Publishing to crates.io..."
-          cargo publish --verbose
-          echo "✅ Published successfully!"
-
   create-release:
-    name: Create GitHub Release
-    needs: [build, checksum]
+    name: Create GitHub release
+    needs: [prepare, verify, build, checksum]
     runs-on: ubuntu-latest
-    if: github.event_name == 'push'
     permissions:
       contents: write
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-      
-      - name: Get version from tag
-        id: get_version
-        run: |
-          VERSION=${GITHUB_REF_NAME#v}
-          echo "version=$VERSION" >> $GITHUB_OUTPUT
-          echo "tag=${{ github.ref_name }}" >> $GITHUB_OUTPUT
-          echo "📦 Version: $VERSION"
-      
-      - name: Download all artifacts
-        uses: actions/download-artifact@v4
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
         with:
           path: artifacts
-          pattern: anytls-*-${{ github.ref_name }}
+          pattern: anytls-*-${{ needs.prepare.outputs.tag }}
           merge-multiple: true
-      
-      - name: Download checksums
-        uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v4
         with:
           path: checksums
-          pattern: checksums-*
-          merge-multiple: true
-          if-no-files-found: ignore
-      
-      - name: List artifacts
+          name: checksums-${{ needs.prepare.outputs.tag }}
+      - name: Prepare release notes
+        env:
+          RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
         run: |
-          echo "📦 Artifacts to include:"
-          find artifacts -type f \( -name "*.tar.gz" -o -name "*.zip" -o -name "*.sha256" \) | sort
-      
-      - name: Generate release notes
-        id: changelog
-        run: |
-          VERSION=${{ steps.get_version.outputs.version }}
-          TAG=${{ steps.get_version.outputs.tag }}
-          
-          # Create release notes
-          cat > RELEASE_NOTES.md << EOF
-          # Release $TAG
-          
-          EOF
-          
-          # Extract changelog for this version
-          if [ -f docs/CHANGELOG.md ]; then
-            echo "📝 Extracting changelog for version $VERSION..."
-            awk "/^## \[$VERSION\]/,/^## \[/" docs/CHANGELOG.md | sed '$d' >> RELEASE_NOTES.md || true
+          NOTES="docs/RELEASE_NOTES_${RELEASE_TAG}.md"
+          if [ -f "$NOTES" ]; then
+            cp "$NOTES" RELEASE_NOTES.md
+          else
+            printf '# Release %s\n\nSee the changelog and attached binaries.\n' "$RELEASE_TAG" > RELEASE_NOTES.md
           fi
-          
-          # Add download information
-          cat >> RELEASE_NOTES.md << EOF
-          
-          ## 📦 Downloads
-          
-          ### Pre-built Binaries
-          
-          **Linux:**
-          - \`anytls-linux-x86_64-$TAG.tar.gz\` - Linux x86_64 (Intel/AMD, GNU)
-          - \`anytls-linux-aarch64-$TAG.tar.gz\` - Linux ARM64 (GNU)
-          - \`anytls-linux-x86_64-musl-$TAG.tar.gz\` - Linux x86_64 (Intel/AMD, musl)
-          
-          **macOS:**
-          - \`anytls-macos-x86_64-$TAG.tar.gz\` - macOS Intel
-          - \`anytls-macos-arm64-$TAG.tar.gz\` - macOS Apple Silicon (M1/M2)
-          
-          **Windows:**
-          - \`anytls-windows-x86_64-$TAG.zip\` - Windows x86_64
-          - \`anytls-windows-arm64-$TAG.zip\` - Windows ARM64
-          
-          Each archive contains:
-          - \`anytls-client\` - Client binary
-          - \`anytls-server\` - Server binary
-          
-          ### Install from crates.io
-          
-          \`\`\`bash
-          cargo install anytls-rs
-          \`\`\`
-          
-          Or add to your \`Cargo.toml\`:
-          
-          \`\`\`toml
-          [dependencies]
-          anytls-rs = "$VERSION"
-          \`\`\`
-          
-          ### Verify Downloads
-          
-          SHA256 checksums are included with each release. Verify with:
-          
-          \`\`\`bash
-          # Linux/macOS
-          shasum -a 256 -c <archive>.sha256
-          
-          # Windows (PowerShell)
-          Get-FileHash <archive>.zip -Algorithm SHA256 | Compare-Object (Get-Content <archive>.zip.sha256)
-          \`\`\`
-          EOF
-          
-          echo "✅ Release notes generated"
-      
-      - name: Create GitHub Release
-        uses: softprops/action-gh-release@v1
+          cat >> RELEASE_NOTES.md <<'NOTES'
+
+          ## Downloads
+
+          Archives include `anytls-server`, `anytls-client`, documentation, and LICENSE.
+          Use the archive matching your operating system and CPU. Each archive has a
+          SHA256 file; verify on Linux/macOS with `shasum -a 256 -c <archive>.sha256`.
+          Custom releases are distributed here, not through crates.io.
+          NOTES
+      - name: Publish tag and release
+        uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ needs.prepare.outputs.tag }}
+          target_commitish: ${{ github.sha }}
+          name: ${{ needs.prepare.outputs.tag }}
           files: |
-            artifacts/**/*
-            checksums/**/*
+            artifacts/*.tar.gz
+            artifacts/*.zip
+            checksums/*.sha256
+          fail_on_unmatched_files: true
           body_path: RELEASE_NOTES.md
           draft: false
           prerelease: false
           generate_release_notes: true
-          token: ${{ secrets.GITHUB_TOKEN }}
-      
-      - name: Release summary
-        run: |
-          echo "✅ GitHub Release created successfully!"
-          echo "📦 Version: ${{ steps.get_version.outputs.tag }}"
-          echo "🔗 Check: https://github.com/${{ github.repository }}/releases/tag/${{ steps.get_version.outputs.tag }}"
