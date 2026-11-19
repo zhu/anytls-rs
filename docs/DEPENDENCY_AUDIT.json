@@ -1,0 +1,354 @@
+{
+  "checked_on": "2026-11-19",
+  "tool": "cargo-audit 0.23.0",
+  "database_commit": "472a4c9a785030434f15d7da84964d60fbe789ab",
+  "database_advisory_count": 1533,
+  "before": {
+    "run_id": 44460999178,
+    "head_sha": "42b70f36f2da67a9d2b4715e71a1a3dd17715e61",
+    "job_id": 135347469212,
+    "audit_exit_code": 1,
+    "dependency_count": 257,
+    "vulnerabilities": [
+      {
+        "crate": "aws-lc-sys",
+        "version": "0.32.3",
+        "id": "RUSTSEC-2026-0047",
+        "title": "PKCS7_verify Signature Validation Bypass in AWS-LC",
+        "solution": "Upgrade to >=0.38.0 (patched)"
+      },
+      {
+        "crate": "aws-lc-sys",
+        "version": "0.32.3",
+        "id": "RUSTSEC-2026-0048",
+        "title": "CRL Distribution Point Scope Check Logic Error in AWS-LC",
+        "solution": "Upgrade to >=0.39.0 (patched)"
+      },
+      {
+        "crate": "aws-lc-sys",
+        "version": "0.32.3",
+        "id": "RUSTSEC-2026-0044",
+        "title": "AWS-LC X.509 Name Constraints Bypass via Wildcard/Unicode CN",
+        "solution": "Upgrade to >=0.39.0 (patched)"
+      },
+      {
+        "crate": "aws-lc-sys",
+        "version": "0.32.3",
+        "id": "RUSTSEC-2026-0046",
+        "title": "PKCS7_verify Certificate Chain Validation Bypass in AWS-LC",
+        "solution": "Upgrade to >=0.38.0 (patched)"
+      },
+      {
+        "crate": "aws-lc-sys",
+        "version": "0.32.3",
+        "id": "RUSTSEC-2026-0045",
+        "title": "Timing Side-Channel in AES-CCM Tag Verification in AWS-LC",
+        "solution": "Upgrade to >=0.38.0 (patched)"
+      },
+      {
+        "crate": "bytes",
+        "version": "1.10.1",
+        "id": "RUSTSEC-2026-0007",
+        "title": "Integer overflow in `BytesMut::reserve`",
+        "solution": "Upgrade to >=1.11.1 (patched)"
+      },
+      {
+        "crate": "crossbeam-epoch",
+        "version": "0.9.18",
+        "id": "RUSTSEC-2026-0204",
+        "title": "Invalid pointer dereference in `fmt::Pointer` impl for `Atomic` and `Shared` when the underlying pointer is invalid",
+        "solution": "Upgrade to >=0.9.20 (patched)"
+      },
+      {
+        "crate": "idna",
+        "version": "0.4.0",
+        "id": "RUSTSEC-2024-0421",
+        "title": "`idna` accepts Punycode labels that do not produce any non-ASCII when decoded",
+        "solution": "Upgrade to >=1.0.0 (patched)"
+      },
+      {
+        "crate": "rustls",
+        "version": "0.23.35",
+        "id": "RUSTSEC-2026-0348",
+        "title": "Brotli certificate decompression can allocate up to 1 GiB before authentication",
+        "solution": "Upgrade to >=0.23.46 (patched)"
+      },
+      {
+        "crate": "rustls",
+        "version": "0.23.35",
+        "id": "RUSTSEC-2026-0349",
+        "title": "Unauthenticated ServerHello can downgrade later connections to classical key exchange",
+        "solution": "Upgrade to >=0.23.46 (patched)"
+      },
+      {
+        "crate": "rustls",
+        "version": "0.23.35",
+        "id": "RUSTSEC-2026-0285",
+        "title": "TLS 1.3 handshake messages incorrectly accepted across encryption level boundaries",
+        "solution": "Upgrade to >=0.23.45 (patched)"
+      },
+      {
+        "crate": "rustls",
+        "version": "0.23.35",
+        "id": "RUSTSEC-2026-0346",
+        "title": "`Debug` impls for client session values expose TLS secrets",
+        "solution": "Upgrade to >=0.23.46 (patched)"
+      },
+      {
+        "crate": "rustls-webpki",
+        "version": "0.103.8",
+        "id": "RUSTSEC-2026-0104",
+        "title": "Reachable panic in certificate revocation list parsing",
+        "solution": "Upgrade to >=0.103.13, <0.104.0-alpha.1 OR >=0.104.0-alpha.7 (patched)"
+      },
+      {
+        "crate": "rustls-webpki",
+        "version": "0.103.8",
+        "id": "RUSTSEC-2026-0382",
+        "title": "Certificate verification may accept distrusted intermediates",
+        "solution": "Upgrade to >=0.103.16, <0.104.0-alpha.1 OR >=0.104.0-alpha.8 (patched)"
+      },
+      {
+        "crate": "rustls-webpki",
+        "version": "0.103.8",
+        "id": "RUSTSEC-2026-0098",
+        "title": "Name constraints for URI names were incorrectly accepted",
+        "solution": "Upgrade to >=0.103.12, <0.104.0-alpha.1 OR >=0.104.0-alpha.6 (patched)"
+      },
+      {
+        "crate": "rustls-webpki",
+        "version": "0.103.8",
+        "id": "RUSTSEC-2026-0099",
+        "title": "Name constraints were accepted for certificates asserting a wildcard name",
+        "solution": "Upgrade to >=0.103.12, <0.104.0-alpha.1 OR >=0.104.0-alpha.6 (patched)"
+      },
+      {
+        "crate": "rustls-webpki",
+        "version": "0.103.8",
+        "id": "RUSTSEC-2026-0049",
+        "title": "CRLs not considered authoritative by Distribution Point due to faulty matching logic",
+        "solution": "Upgrade to >=0.103.10 (patched)"
+      },
+      {
+        "crate": "time",
+        "version": "0.3.44",
+        "id": "RUSTSEC-2026-0009",
+        "title": "Denial of Service via Stack Exhaustion",
+        "solution": "Upgrade to >=0.3.47 (patched)"
+      }
+    ],
+    "allowed_warnings": [
+      {
+        "crate": "chrono",
+        "version": "0.4.42",
+        "id": "RUSTSEC-2026-0543",
+        "title": "chrono is unmaintained",
+        "solution": "No fixed upgrade is available!"
+      },
+      {
+        "crate": "pin-utils",
+        "version": "0.1.0",
+        "id": "RUSTSEC-2026-0441",
+        "title": "`pin-utils` is unmaintained",
+        "solution": "No fixed upgrade is available!"
+      },
+      {
+        "crate": "rustls-pemfile",
+        "version": "2.2.0",
+        "id": "RUSTSEC-2025-0134",
+        "title": "rustls-pemfile is unmaintained",
+        "solution": "No fixed upgrade is available!"
+      },
+      {
+        "crate": "trust-dns-proto",
+        "version": "0.23.2",
+        "id": "RUSTSEC-2025-0017",
+        "title": "The `trust-dns` project has been rebranded to `hickory-dns`",
+        "solution": "No fixed upgrade is available!"
+      },
+      {
+        "crate": "anyhow",
+        "version": "1.0.100",
+        "id": "RUSTSEC-2026-0190",
+        "title": "Unsoundness in `Error::downcast_mut()`",
+        "solution": "Upgrade to >=1.0.103 (patched)"
+      },
+      {
+        "crate": "rand",
+        "version": "0.8.5",
+        "id": "RUSTSEC-2026-0097",
+        "title": "Rand is unsound with a custom logger using `rand::rng()`",
+        "solution": "Upgrade to >=0.10.1 OR <0.10.0, >=0.9.3 OR <0.9.0, >=0.8.6 (patched)"
+      },
+      {
+        "crate": "rand",
+        "version": "0.9.2",
+        "id": "RUSTSEC-2026-0097",
+        "title": "Rand is unsound with a custom logger using `rand::rng()`",
+        "solution": "Upgrade to >=0.10.1 OR <0.10.0, >=0.9.3 OR <0.9.0, >=0.8.6 (patched)"
+      },
+      {
+        "crate": "rustix",
+        "version": "1.1.2",
+        "id": "RUSTSEC-2026-0486",
+        "title": "xattr functions mark unwritten bytes as initialized when given a zero-length buffer",
+        "solution": "Upgrade to >=1.1.6 (patched)"
+      },
+      {
+        "crate": "tokio",
+        "version": "1.48.0",
+        "id": "RUSTSEC-2026-0386",
+        "title": "`AsyncFd::new` and related constructors violate I/O safety",
+        "solution": "Upgrade to >=1.51.6, <1.52.0 OR >=1.53.3 (patched)"
+      }
+    ]
+  },
+  "after": {
+    "dependency_count": 265,
+    "vulnerability_count": 0,
+    "ignored_advisories": [],
+    "warnings": [
+      {
+        "kind": "unmaintained",
+        "package": "chrono",
+        "version": "0.4.42",
+        "id": "RUSTSEC-2026-0543",
+        "title": "chrono is unmaintained"
+      },
+      {
+        "kind": "unmaintained",
+        "package": "pin-utils",
+        "version": "0.1.0",
+        "id": "RUSTSEC-2026-0441",
+        "title": "`pin-utils` is unmaintained"
+      },
+      {
+        "kind": "unmaintained",
+        "package": "rustls-pemfile",
+        "version": "2.2.0",
+        "id": "RUSTSEC-2025-0134",
+        "title": "rustls-pemfile is unmaintained"
+      }
+    ]
+  },
+  "updated_packages": [
+    {
+      "package": "aws-lc-rs",
+      "before": [
+        "1.14.1"
+      ],
+      "after": [
+        "1.19.0"
+      ]
+    },
+    {
+      "package": "aws-lc-sys",
+      "before": [
+        "0.32.3"
+      ],
+      "after": [
+        "0.47.0"
+      ]
+    },
+    {
+      "package": "bytes",
+      "before": [
+        "1.10.1"
+      ],
+      "after": [
+        "1.12.2"
+      ]
+    },
+    {
+      "package": "crossbeam-epoch",
+      "before": [
+        "0.9.18"
+      ],
+      "after": [
+        "0.9.21"
+      ]
+    },
+    {
+      "package": "hickory-resolver",
+      "before": [],
+      "after": [
+        "0.26.3"
+      ]
+    },
+    {
+      "package": "idna",
+      "before": [
+        "0.4.0",
+        "1.1.0"
+      ],
+      "after": [
+        "1.1.0"
+      ]
+    },
+    {
+      "package": "rustls",
+      "before": [
+        "0.23.35"
+      ],
+      "after": [
+        "0.23.46"
+      ]
+    },
+    {
+      "package": "rustls-webpki",
+      "before": [
+        "0.103.8"
+      ],
+      "after": [
+        "0.103.17"
+      ]
+    },
+    {
+      "package": "time",
+      "before": [
+        "0.3.44"
+      ],
+      "after": [
+        "0.3.55"
+      ]
+    },
+    {
+      "package": "tokio",
+      "before": [
+        "1.48.0"
+      ],
+      "after": [
+        "1.54.1"
+      ]
+    },
+    {
+      "package": "anyhow",
+      "before": [
+        "1.0.100"
+      ],
+      "after": [
+        "1.0.104"
+      ]
+    },
+    {
+      "package": "rand",
+      "before": [
+        "0.8.5",
+        "0.9.2"
+      ],
+      "after": [
+        "0.9.5",
+        "0.10.4"
+      ]
+    },
+    {
+      "package": "rustix",
+      "before": [
+        "1.1.2"
+      ],
+      "after": [
+        "1.1.6"
+      ]
+    }
+  ]
+}
