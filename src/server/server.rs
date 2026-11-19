@@ -263,6 +263,12 @@ async fn run_session(
     };
     // close() cancels blocked reads/writes and wakes every live stream.
     session.close().await?;
+    // Allow the task that initiated close to finish cleanup before cancellation.
+    // Session shutdown itself bounds its transport work to one second.
+    let _ = tokio::time::timeout(Duration::from_secs(2), async {
+        while tasks.join_next().await.is_some() {}
+    })
+    .await;
     tasks.abort_all();
     while tasks.join_next().await.is_some() {}
     match result {
@@ -331,11 +337,12 @@ mod tests {
             .await
             .unwrap();
         let (tcp, _) = listener.accept().await.unwrap();
+        let tls_config = server.tls_config.read().unwrap().clone();
         let result = timeout(
             TEST_DEADLINE,
             handle_connection(
                 tcp,
-                server.tls_config.read().unwrap().clone(),
+                tls_config,
                 server.password_hash,
                 server.padding,
                 None,
