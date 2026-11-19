@@ -118,7 +118,16 @@ impl Server {
                     }
                 }
                 accepted = listener.accept() => {
-                    let (stream, addr) = accepted?;
+                    let (stream, addr) = match accepted {
+                        Ok(connection) => connection,
+                        Err(error) => {
+                            // A reset queued connection or temporary descriptor pressure
+                            // must not terminate the listener and all healthy sessions.
+                            tracing::warn!("[Server] Accept failed: {}", error);
+                            tokio::time::sleep(Duration::from_millis(100)).await;
+                            continue;
+                        }
+                    };
                     let Ok(permit) = self.connection_limit.clone().try_acquire_owned() else {
                         tracing::debug!("[Server] Connection limit reached; rejecting {}", addr);
                         continue;
