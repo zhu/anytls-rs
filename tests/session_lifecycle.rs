@@ -1,14 +1,16 @@
 use anytls_rs::padding::PaddingFactory;
+use anytls_rs::protocol::{Command, Frame, FrameCodec};
 use anytls_rs::session::Session;
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use std::io;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
-use tokio::io::{AsyncWrite, duplex, empty, sink};
+use tokio::io::{AsyncWrite, AsyncWriteExt, duplex, empty, sink};
 use tokio::sync::Notify;
 use tokio::time::timeout;
+use tokio_util::codec::Encoder;
 
 const DEADLINE: Duration = Duration::from_secs(2);
 
@@ -121,5 +123,111 @@ async fn closing_before_processor_starts_releases_stream_writers() {
             .unwrap()
             .is_err()
     );
+    assert!(!session.has_active_streams().await);
+}
+
+#[tokio::test]
+async fn remote_fin_closes_retained_stream_and_preserves_preceding_data() {
+    let (reader, mut peer) = duplex(128);
+    let session = Arc::new(Session::new_client(
+        reader,
+        sink(),
+        PaddingFactory::default(),
+        None,
+    ));
+    let (stream, synack) = session.open_stream().await.unwrap();
+    let recv = tokio::spawn({
+        let session = session.clone();
+        async move { session.recv_loop().await }
+    });
+    let mut wire = BytesMut::new();
+    FrameCodec
+        .encode(
+            Frame::data(stream.id(), Bytes::from_static(b"tail")),
+            &mut wire,
+        )
+        .unwrap();
+    FrameCodec
+        .encode(Frame::control(Command::Fin, stream.id()), &mut wire)
+        .unwrap();
+    peer.write_all(&wire).await.unwrap();
+    assert!(timeout(DEADLINE, synack).await.unwrap().unwrap().is_err());
+    assert!(stream.is_closed());
+    assert!(!session.has_active_streams().await);
+    assert!(stream.send_data(Bytes::from_static(b"late")).await.is_err());
+    let mut reader = stream.reader().lock().await;
+    let mut data = [0; 8];
+    assert_eq!(reader.read(&mut data).await.unwrap(), 4);
+    assert_eq!(&data[..4], b"tail");
+    assert_eq!(
+        timeout(DEADLINE, reader.read(&mut data))
+            .await
+            .unwrap()
+            .unwrap(),
+        0
+    );
+    session.close().await.unwrap();
+    timeout(DEADLINE, recv).await.unwrap().unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn local_error_emits_fin_and_evicts_stream() {
+    let (writer, mut peer) = duplex(128);
+    let padding = Arc::new(PaddingFactory::new(b"stop=0").unwrap());
+    let session = Arc::new(Session::new_client(empty(), writer, padding, None));
+    let (stream, synack) = session.open_stream().await.unwrap();
+    let process = tokio::spawn({
+        let session = session.clone();
+        async move { session.process_stream_data().await }
+    });
+    stream
+        .close_with_error(anytls_rs::util::AnyTlsError::Protocol("test".into()))
+        .await;
+    assert!(synack.await.unwrap().is_err());
+    let mut wire = [0; 14];
+    timeout(
+        DEADLINE,
+        tokio::io::AsyncReadExt::read_exact(&mut peer, &mut wire),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(wire[0], Command::Syn as u8);
+    assert_eq!(wire[7], Command::Fin as u8);
+    assert!(!session.has_active_streams().await);
+    session.close().await.unwrap();
+    timeout(DEADLINE, process).await.unwrap().unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn alert_closes_all_stream_maps_and_processor() {
+    let (reader, mut peer) = duplex(128);
+    let session = Arc::new(Session::new_client(
+        reader,
+        sink(),
+        PaddingFactory::default(),
+        None,
+    ));
+    let (stream, synack) = session.open_stream().await.unwrap();
+    let recv = tokio::spawn({
+        let session = session.clone();
+        async move { session.recv_loop().await }
+    });
+    let process = tokio::spawn({
+        let session = session.clone();
+        async move { session.process_stream_data().await }
+    });
+    let mut wire = BytesMut::new();
+    FrameCodec
+        .encode(
+            Frame::with_data(Command::Alert, 0, Bytes::from_static(b"test")),
+            &mut wire,
+        )
+        .unwrap();
+    peer.write_all(&wire).await.unwrap();
+    assert!(timeout(DEADLINE, recv).await.unwrap().unwrap().is_err());
+    timeout(DEADLINE, process).await.unwrap().unwrap().unwrap();
+    assert!(stream.is_closed());
+    assert!(synack.await.unwrap().is_err());
     assert!(!session.has_active_streams().await);
 }

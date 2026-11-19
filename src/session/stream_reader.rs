@@ -5,7 +5,7 @@
 
 use bytes::Bytes;
 use std::io;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 
 /// StreamReader 管理单个流的读取状态
 ///
@@ -27,6 +27,8 @@ pub struct StreamReader {
 
     /// EOF 标志
     eof: bool,
+
+    close_notify: Option<watch::Receiver<bool>>,
 }
 
 impl StreamReader {
@@ -37,7 +39,12 @@ impl StreamReader {
             reader_rx,
             reader_buffer: Vec::new(),
             eof: false,
+            close_notify: None,
         }
+    }
+
+    pub(crate) fn set_close_notification(&mut self, close_notify: watch::Receiver<bool>) {
+        self.close_notify = Some(close_notify);
     }
 
     /// 读取数据到 buffer
@@ -47,6 +54,9 @@ impl StreamReader {
     /// 2. buffer 为空时从 channel 接收
     /// 3. 处理 EOF 情况
     pub async fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
         // 1. 先检查 EOF
         if self.eof && self.reader_buffer.is_empty() {
             return Ok(0);
@@ -68,40 +78,33 @@ impl StreamReader {
             return Ok(n);
         }
 
-        // 3. buffer 为空，从 channel 接收新数据
-        match self.reader_rx.recv().await {
-            Some(data) => {
-                let data_len = data.len();
-                tracing::debug!(
-                    "[StreamReader] Received {} bytes from channel (stream_id={})",
-                    data_len,
-                    self.id
-                );
-
-                // 直接填充到 buf
-                let n = std::cmp::min(data.len(), buf.len());
-                buf[..n].copy_from_slice(&data[..n]);
-
-                // 剩余数据放入 buffer
-                if n < data.len() {
-                    self.reader_buffer.extend_from_slice(&data[n..]);
-                    tracing::trace!(
-                        "[StreamReader] Stored {} bytes in buffer (stream_id={})",
-                        data.len() - n,
-                        self.id
-                    );
+        // Drain data already received before a FIN, then expose EOF. Closing
+        // the receiver wakes any session task blocked on this stream's queue.
+        loop {
+            let data = if let Some(closed) = self.close_notify.as_mut() {
+                tokio::select! {
+                    biased;
+                    data = self.reader_rx.recv() => data,
+                    _ = async { let _ = closed.wait_for(|closed| *closed).await; } => {
+                        self.reader_rx.close();
+                        self.reader_rx.recv().await
+                    }
                 }
-
-                Ok(n)
-            }
-            None => {
-                // Channel 关闭，表示 EOF
-                tracing::debug!(
-                    "[StreamReader] Channel closed (EOF) for stream_id={}",
-                    self.id
-                );
-                self.eof = true;
-                Ok(0)
+            } else {
+                self.reader_rx.recv().await
+            };
+            match data {
+                Some(data) if data.is_empty() => continue,
+                Some(data) => {
+                    let n = data.len().min(buf.len());
+                    buf[..n].copy_from_slice(&data[..n]);
+                    self.reader_buffer.extend_from_slice(&data[n..]);
+                    return Ok(n);
+                }
+                None => {
+                    self.eof = true;
+                    return Ok(0);
+                }
             }
         }
     }

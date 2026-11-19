@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 
 /// Stream represents a single data stream within a Session
 /// It implements AsyncRead and AsyncWrite to be used as a connection
@@ -26,11 +26,11 @@ pub struct Stream {
     writer_tx: mpsc::Sender<(u32, Bytes)>,
 
     // ===== SYNACK 通知 (用于超时检测) =====
-    synack_tx: Arc<tokio::sync::Mutex<Option<oneshot::Sender<Result<()>>>>>,
+    synack_tx: std::sync::Mutex<Option<oneshot::Sender<Result<()>>>>,
 
     // ===== 状态管理 =====
     is_closed: Arc<AtomicBool>,
-    close_error: Arc<tokio::sync::Mutex<Option<AnyTlsError>>>,
+    close_notify: watch::Sender<bool>,
 
     // Guards the one-shot stream-close sentinel so a FIN is emitted at most
     // once regardless of how many times `close()`/`poll_shutdown` fire.
@@ -49,18 +49,20 @@ impl Stream {
     /// (Stream, Receiver) - The receiver can be used to wait for SYNACK
     pub fn new(
         id: u32,
-        reader: StreamReader,
+        mut reader: StreamReader,
         writer_tx: mpsc::Sender<(u32, Bytes)>,
     ) -> (Self, oneshot::Receiver<Result<()>>) {
         let (synack_tx, synack_rx) = oneshot::channel();
+        let (close_notify, close_rx) = watch::channel(false);
+        reader.set_close_notification(close_rx);
 
         let stream = Self {
             id,
             reader: Arc::new(tokio::sync::Mutex::new(reader)),
             writer_tx,
-            synack_tx: Arc::new(tokio::sync::Mutex::new(Some(synack_tx))),
+            synack_tx: std::sync::Mutex::new(Some(synack_tx)),
             is_closed: Arc::new(AtomicBool::new(false)),
-            close_error: Arc::new(tokio::sync::Mutex::new(None)),
+            close_notify,
             fin_sent: Arc::new(AtomicBool::new(false)),
         };
 
@@ -72,24 +74,31 @@ impl Stream {
     /// # Arguments
     /// * `result` - Ok(()) for success, Err for error
     pub async fn notify_synack(&self, result: Result<()>) {
-        let mut tx_guard = self.synack_tx.lock().await;
-        match tx_guard.take() {
-            Some(tx) => {
-                let result_clone = match &result {
-                    Ok(()) => Ok(()),
-                    Err(e) => Err(AnyTlsError::Protocol(e.to_string())),
-                };
-                let _ = tx.send(result_clone);
-                tracing::debug!(
-                    "[Stream] SYNACK notified for stream {}: {:?}",
-                    self.id,
-                    result.is_ok()
-                );
-            }
-            _ => {
-                tracing::warn!("[Stream] SYNACK already notified for stream {}", self.id);
-            }
+        self.finish_synack(result);
+    }
+
+    fn finish_synack(&self, result: Result<()>) {
+        if let Some(tx) = self.synack_tx.lock().expect("SYNACK mutex poisoned").take() {
+            let _ = tx.send(result);
         }
+    }
+
+    fn mark_closed(&self, error: AnyTlsError) {
+        self.is_closed.store(true, Ordering::Release);
+        self.close_notify.send_replace(true);
+        self.finish_synack(Err(error));
+    }
+
+    /// Close after a peer FIN or session failure, without echoing a FIN.
+    pub(crate) fn close_locally(&self, error: AnyTlsError) {
+        self.fin_sent.store(true, Ordering::Release);
+        self.mark_closed(error);
+    }
+
+    /// Wait for local, remote, or session closure, without losing early closes.
+    pub async fn closed(&self) {
+        let mut closed = self.close_notify.subscribe();
+        let _ = closed.wait_for(|closed| *closed).await;
     }
 
     /// Get stream ID
@@ -99,18 +108,8 @@ impl Stream {
 
     /// Close the stream with error (can be called with `Arc<Stream>`)
     pub async fn close_with_error(&self, err: AnyTlsError) {
-        if self
-            .is_closed
-            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-            .is_ok()
-        {
-            tracing::warn!(
-                stream_id = self.id,
-                cause = %err,
-                "[Stream] Closing stream with error"
-            );
-            *self.close_error.lock().await = Some(err);
-        }
+        self.mark_closed(err);
+        self.close();
     }
 
     /// Check if stream is closed
@@ -118,19 +117,16 @@ impl Stream {
         self.is_closed.load(Ordering::Relaxed)
     }
 
-    /// Gracefully close this client stream.
+    /// Close this stream and enqueue its FIN after all previously queued data.
     ///
     /// Signals the owning session (via the writer channel's empty-`Bytes`
     /// sentinel — see `Session::process_stream_data`) to emit a `Fin` frame
-    /// for this stream id and evict it from the session's stream maps. Without
-    /// this, client streams were never removed from `Session::streams` /
-    /// `Session::stream_receive_tx` and never FIN-acked to the peer, so both
-    /// maps grew unbounded for the life of the (long-lived, pooled) session.
+    /// for this stream id and evict it from the session's stream maps.
     ///
-    /// Lock-free and idempotent, so it is safe to call from `poll_shutdown`
+    /// Synchronous and idempotent, so it is safe to call from `poll_shutdown`
     /// or a `Drop` impl on a wrapper type.
     pub fn close(&self) {
-        self.is_closed.store(true, Ordering::Relaxed);
+        self.mark_closed(AnyTlsError::Io(std::io::ErrorKind::BrokenPipe.into()));
         if self
             .fin_sent
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
@@ -167,7 +163,19 @@ impl Stream {
         &self,
         data: Bytes,
     ) -> std::result::Result<(), mpsc::error::SendError<(u32, Bytes)>> {
-        self.writer_tx.send((self.id, data)).await
+        if self.is_closed() {
+            return Err(mpsc::error::SendError((self.id, data)));
+        }
+        // Empty data is not a close request. Only close()/shutdown() enqueue
+        // the internal FIN sentinel.
+        if data.is_empty() {
+            return Ok(());
+        }
+        tokio::select! {
+            biased;
+            _ = self.closed() => Err(mpsc::error::SendError((self.id, data.clone()))),
+            result = self.writer_tx.send((self.id, data.clone())) => result,
+        }
     }
 }
 
@@ -243,6 +251,10 @@ impl AsyncWrite for Stream {
             )));
         }
 
+        if buf.is_empty() {
+            return Poll::Ready(Ok(0));
+        }
+
         // Send data to session via channel
         let data = Bytes::copy_from_slice(buf);
         tracing::trace!(
@@ -263,8 +275,12 @@ impl AsyncWrite for Stream {
                 if let Ok(handle) = tokio::runtime::Handle::try_current() {
                     let writer_tx = self.writer_tx.clone();
                     let waker = cx.waker().clone();
+                    let mut closed = self.close_notify.subscribe();
                     handle.spawn(async move {
-                        let _ = writer_tx.reserve().await;
+                        tokio::select! {
+                            _ = writer_tx.reserve() => {},
+                            _ = closed.wait_for(|closed| *closed) => {},
+                        }
                         waker.wake();
                     });
                 } else {
@@ -292,7 +308,7 @@ impl AsyncWrite for Stream {
     }
 
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        self.is_closed.store(true, Ordering::Relaxed);
+        self.mark_closed(AnyTlsError::Io(std::io::ErrorKind::BrokenPipe.into()));
         if self.fin_sent.load(Ordering::Acquire) {
             return Poll::Ready(Ok(()));
         }
@@ -324,6 +340,68 @@ mod tests {
     use super::*;
     use crate::session::StreamReader;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn remote_close_wakes_read_and_synack_without_echo_fin() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let (_reader_tx, reader_rx) = mpsc::channel(1);
+        let (stream, synack) = Stream::new(1, StreamReader::new(1, reader_rx), tx);
+        let stream = Arc::new(stream);
+        let read = tokio::spawn({
+            let stream = stream.clone();
+            async move { stream.reader().lock().await.read(&mut [0; 1]).await }
+        });
+        tokio::task::yield_now().await;
+        stream.close_locally(AnyTlsError::SessionClosed);
+        stream.close();
+        assert!(stream.is_closed());
+        assert!(synack.await.unwrap().is_err());
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), read)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap(),
+            0
+        );
+        assert!(rx.try_recv().is_err(), "a received FIN must not be echoed");
+    }
+
+    #[tokio::test]
+    async fn closing_stream_cancels_backpressured_send() {
+        let (tx, _rx) = mpsc::channel(1);
+        let (_reader_tx, reader_rx) = mpsc::channel(1);
+        let (stream, _) = Stream::new(1, StreamReader::new(1, reader_rx), tx);
+        stream
+            .send_data(Bytes::from_static(b"first"))
+            .await
+            .unwrap();
+        let send = stream.send_data(Bytes::from_static(b"second"));
+        tokio::pin!(send);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), &mut send)
+                .await
+                .is_err()
+        );
+        stream.close_locally(AnyTlsError::SessionClosed);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), send)
+                .await
+                .unwrap()
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_writes_do_not_enqueue_fin() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let (_reader_tx, reader_rx) = mpsc::channel(1);
+        let (mut stream, _) = Stream::new(1, StreamReader::new(1, reader_rx), tx);
+        stream.send_data(Bytes::new()).await.unwrap();
+        assert_eq!(stream.write(&[]).await.unwrap(), 0);
+        assert!(rx.try_recv().is_err());
+        assert!(!stream.is_closed());
+    }
 
     #[tokio::test]
     async fn test_stream_write() {

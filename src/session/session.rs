@@ -247,8 +247,7 @@ impl Session {
         let streams: Vec<_> = self.streams.write().await.drain().map(|(_, s)| s).collect();
         self.stream_receive_tx.write().await.clear();
         for stream in streams {
-            stream.close_with_error(AnyTlsError::SessionClosed).await;
-            stream.notify_synack(Err(AnyTlsError::SessionClosed)).await;
+            stream.close_locally(AnyTlsError::SessionClosed);
         }
 
         // Include lock acquisition in the timeout. In-flight writes are
@@ -490,12 +489,15 @@ impl Session {
                     "[Session] handle_frame: Released stream_receive_tx read lock"
                 );
 
-                if let Some(tx) = tx {
+                let stream = self.streams.read().await.get(&frame.stream_id).cloned();
+                if let (Some(tx), Some(stream)) = (tx, stream) {
                     if self.is_closed() {
                         return Err(AnyTlsError::SessionClosed);
                     }
 
                     tokio::select! {
+                        biased;
+                        _ = stream.closed() => {},
                         result = tx.send(frame.data) => {
                             match result {
                                 Ok(_) => {
@@ -551,15 +553,8 @@ impl Session {
 
                     let stream = Arc::new(stream);
 
-                    {
-                        let mut receive_map = self.stream_receive_tx.write().await;
-                        receive_map.insert(stream_id, receive_tx);
-                    }
-
-                    {
-                        let mut streams = self.streams.write().await;
-                        streams.insert(stream_id, stream.clone());
-                    }
+                    self.register_stream(stream_id, stream.clone(), receive_tx)
+                        .await?;
 
                     tracing::trace!(
                         session_id = session_id,
@@ -622,7 +617,7 @@ impl Session {
                             // Notify stream about the error
                             let error =
                                 AnyTlsError::Protocol(format!("Server error: {}", error_msg));
-                            stream.notify_synack(Err(error)).await;
+                            stream.close_with_error(error).await;
                         } else {
                             tracing::info!(
                                 session_id = session_id,
@@ -653,10 +648,14 @@ impl Session {
                     "[Session] FIN received for stream {}, closing",
                     frame.stream_id
                 );
-                let mut streams = self.streams.write().await;
-                streams.remove(&frame.stream_id);
-                let mut receive_map = self.stream_receive_tx.write().await;
-                receive_map.remove(&frame.stream_id);
+                let stream = self.streams.write().await.remove(&frame.stream_id);
+                self.stream_receive_tx
+                    .write()
+                    .await
+                    .remove(&frame.stream_id);
+                if let Some(stream) = stream {
+                    stream.close_locally(AnyTlsError::Io(std::io::ErrorKind::BrokenPipe.into()));
+                }
             }
             Command::Settings => {
                 // Client settings (server side)
@@ -751,20 +750,7 @@ impl Session {
                     "Unknown alert".to_string()
                 };
                 tracing::error!("[Session] Received Alert frame (fatal): {}", alert_msg);
-                // Close all streams
-                let mut streams = self.streams.write().await;
-                for (stream_id, stream) in streams.drain() {
-                    let error = AnyTlsError::Protocol(format!(
-                        "Session closed due to alert: {}",
-                        alert_msg
-                    ));
-                    stream.close_with_error(error).await;
-                    tracing::debug!("[Session] Closed stream {} due to alert", stream_id);
-                }
-                drop(streams);
-                // Mark session as closed
-                self.is_closed
-                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                self.close().await?;
                 return Err(AnyTlsError::Protocol(format!("Alert: {}", alert_msg)));
             }
             Command::HeartRequest => {
@@ -840,17 +826,8 @@ impl Session {
 
         let stream = Arc::new(stream);
 
-        // Store the receive_tx for sending data to this stream
-        {
-            let mut receive_map = self.stream_receive_tx.write().await;
-            receive_map.insert(stream_id, receive_tx);
-        }
-
-        // Store the stream
-        {
-            let mut streams = self.streams.write().await;
-            streams.insert(stream_id, stream.clone());
-        }
+        self.register_stream(stream_id, stream.clone(), receive_tx)
+            .await?;
 
         tracing::trace!("[Session] Stream {} stored in session", stream_id);
 
@@ -861,6 +838,25 @@ impl Session {
         tracing::debug!("[Session] SYN frame sent for stream {}", stream_id);
 
         Ok((stream, synack_rx))
+    }
+
+    async fn register_stream(
+        &self,
+        stream_id: u32,
+        stream: Arc<Stream>,
+        receive_tx: mpsc::Sender<Bytes>,
+    ) -> Result<()> {
+        // Serialize registration with close() draining the map. An early
+        // is_closed() check alone can leave a stream behind after that drain.
+        let mut streams = self.streams.write().await;
+        if self.is_closed() {
+            stream.close_locally(AnyTlsError::SessionClosed);
+            return Err(AnyTlsError::SessionClosed);
+        }
+        let mut receive_map = self.stream_receive_tx.write().await;
+        streams.insert(stream_id, stream);
+        receive_map.insert(stream_id, receive_tx);
+        Ok(())
     }
 
     /// Disable buffering (this will flush buffer on next write)
@@ -1361,11 +1357,20 @@ impl Session {
                             "[Session] process_stream_data: closing stream {} (FIN)",
                             stream_id
                         );
-                        let _ = self
-                            .write_control_frame(Frame::control(Command::Fin, stream_id))
-                            .await;
-                        self.streams.write().await.remove(&stream_id);
+                        let stream = self.streams.write().await.remove(&stream_id);
                         self.stream_receive_tx.write().await.remove(&stream_id);
+                        if let Some(stream) = stream {
+                            stream.close_locally(AnyTlsError::Io(
+                                std::io::ErrorKind::BrokenPipe.into(),
+                            ));
+                            self.write_control_frame(Frame::control(Command::Fin, stream_id))
+                                .await?;
+                        }
+                        continue;
+                    }
+                    // The peer may have closed while data was queued. A FIN
+                    // closes both directions and must not be answered with data.
+                    if !self.streams.read().await.contains_key(&stream_id) {
                         continue;
                     }
                     let data_len = data.len();
