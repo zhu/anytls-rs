@@ -28,6 +28,10 @@ struct Proxy {
 
 impl Proxy {
     async fn new() -> Self {
+        Self::with_initial_request(None).await
+    }
+
+    async fn with_initial_request(request_and_fin: Option<&[u8]>) -> Self {
         let (transport, mut peer) = duplex(65536);
         let (reader, writer) = tokio::io::split(transport);
         let mut session = Session::new_server(reader, writer, PaddingFactory::default());
@@ -52,6 +56,14 @@ impl Proxy {
         FrameCodec
             .encode(Frame::control(Command::Syn, 1), &mut wire)
             .unwrap();
+        if let Some(request) = request_and_fin {
+            FrameCodec
+                .encode(Frame::data(1, Bytes::copy_from_slice(request)), &mut wire)
+                .unwrap();
+            FrameCodec
+                .encode(Frame::control(Command::Fin, 1), &mut wire)
+                .unwrap();
+        }
         peer.write_all(&wire).await.unwrap();
         let stream = timeout(DEADLINE, rx.recv()).await.unwrap().unwrap();
         let handler = tokio::spawn({
@@ -74,6 +86,22 @@ impl Proxy {
         let mut wire = BytesMut::new();
         FrameCodec
             .encode(Frame::data(1, Bytes::copy_from_slice(data)), &mut wire)
+            .unwrap();
+        timeout(DEADLINE, self.peer.write_all(&wire))
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    async fn send_and_fin(&mut self, data: &[u8]) {
+        let mut wire = BytesMut::new();
+        for chunk in data.chunks(u16::MAX as usize) {
+            FrameCodec
+                .encode(Frame::data(1, Bytes::copy_from_slice(chunk)), &mut wire)
+                .unwrap();
+        }
+        FrameCodec
+            .encode(Frame::control(Command::Fin, 1), &mut wire)
             .unwrap();
         timeout(DEADLINE, self.peer.write_all(&wire))
             .await
@@ -174,6 +202,74 @@ async fn fragmented_address_and_target_eof_preserve_tail_before_fin() {
     assert_eq!(frames.last().unwrap().cmd, Command::Fin);
     proxy.finish().await.unwrap().unwrap();
     timeout(DEADLINE, target_task).await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn initial_request_and_peer_fin_in_one_write_deliver_all_payload() {
+    let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut request = ipv4_address(target.local_addr().unwrap());
+    let payload = vec![0x53; 4096];
+    request.extend_from_slice(&payload);
+    let proxy = Proxy::with_initial_request(Some(&request)).await;
+    let (mut connection, _) = timeout(DEADLINE, target.accept()).await.unwrap().unwrap();
+    let mut received = Vec::new();
+    timeout(DEADLINE, connection.read_to_end(&mut received))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(received, payload);
+    proxy.finish().await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn established_connection_drains_payload_before_peer_fin() {
+    let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut proxy = Proxy::new().await;
+    proxy
+        .send(&ipv4_address(target.local_addr().unwrap()))
+        .await;
+    let (mut connection, _) = timeout(DEADLINE, target.accept()).await.unwrap().unwrap();
+    while proxy.next_frame().await.cmd != Command::SynAck {}
+    let payload = vec![0x7a; 32768];
+    proxy.send_and_fin(&payload).await;
+    let mut received = Vec::new();
+    timeout(DEADLINE, connection.read_to_end(&mut received))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(received.len(), payload.len());
+    assert_eq!(received, payload);
+    proxy.finish().await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn peer_fin_drain_is_bounded_when_target_stops_reading() {
+    let target = TcpSocket::new_v4().unwrap();
+    target.set_recv_buffer_size(1024).unwrap();
+    target.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    let target = target.listen(1).unwrap();
+    let mut proxy = Proxy::new().await;
+    proxy
+        .send(&ipv4_address(target.local_addr().unwrap()))
+        .await;
+    let (_unread_connection, _) = timeout(DEADLINE, target.accept()).await.unwrap().unwrap();
+    while proxy.next_frame().await.cmd != Command::SynAck {}
+
+    // 65 PSH frames fit the receive queue once the relay takes its first
+    // frame, so FIN is parsed even though the destination window is blocked.
+    let payload = vec![0x35; 4 * 1024 * 1024];
+    let started = std::time::Instant::now();
+    proxy.send_and_fin(&payload).await;
+    timeout(DEADLINE, proxy.stream.closed()).await.unwrap();
+    proxy.finish().await.unwrap().unwrap();
+    assert!(
+        started.elapsed() >= Duration::from_millis(900),
+        "test did not exercise a blocked drain"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "closed stream kept the target task alive"
+    );
 }
 
 #[tokio::test]

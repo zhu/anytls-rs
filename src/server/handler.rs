@@ -51,10 +51,29 @@ impl StreamHandler for TcpProxyHandler {
             // FIN is queued behind all successfully queued data, including when
             // the handler is cancelled. Remote FIN/session close suppresses it.
             let _close = CloseStreamOnDrop(stream.clone());
+            let proxy = handle_proxy_stream(stream.clone(), session.clone());
+            tokio::pin!(proxy);
             tokio::select! {
                 biased;
-                _ = stream.closed() => Ok(()),
-                result = handle_proxy_stream(stream.clone(), session) => result,
+                _ = stream.closed() => {
+                    // PSH frames preceding FIN may still be queued. Give the
+                    // relay one bounded opportunity to deliver them before
+                    // dropping both directions. Session shutdown is immediate.
+                    tokio::select! {
+                        biased;
+                        _ = session.closed() => Ok(()),
+                        result = timeout(Duration::from_secs(1), &mut proxy) => {
+                            match result {
+                                Ok(result) => result,
+                                Err(_) => {
+                                    tracing::debug!(stream_id = stream.id(), "Stream close drain timed out");
+                                    Ok(())
+                                }
+                            }
+                        }
+                    }
+                }
+                result = &mut proxy => result,
             }
         })
     }
@@ -94,7 +113,7 @@ async fn handle_proxy_stream(stream: Arc<Stream>, session: Arc<Session>) -> Resu
             .map_err(|_| AnyTlsError::Protocol("SOCKS address timeout (15s)".into()))??;
         tracing::info!(stream_id, host = %destination.addr, port = destination.port, "Proxy destination");
         if let Some(version) = uot_version(&destination.addr) {
-            if peer_version >= 2 {
+            if peer_version >= 2 && !stream.is_closed() {
                 session.write_control_frame(Frame::control(Command::SynAck, stream_id)).await?;
             }
             acknowledged = true;
@@ -109,7 +128,7 @@ async fn handle_proxy_stream(stream: Arc<Stream>, session: Arc<Session>) -> Resu
                 Ok::<_, AnyTlsError>(connect_candidates(addresses, TcpStream::connect).await?)
             }).await.map_err(|_| AnyTlsError::Protocol(format!("Connection timeout (15s) to {}:{}", destination.addr, destination.port)))??;
             configure_tcp_stream(&outbound, &format!("{}:{}", destination.addr, destination.port));
-            if peer_version >= 2 {
+            if peer_version >= 2 && !stream.is_closed() {
                 session.write_control_frame(Frame::control(Command::SynAck, stream_id)).await?;
             }
             acknowledged = true;
@@ -326,35 +345,43 @@ async fn proxy_tcp_connection_data_forwarding(
     let (mut outbound_read, mut outbound_write) = outbound.into_split();
     let mut bytes_to_outbound = 0u64;
     let mut bytes_to_client = 0u64;
-    let to_outbound = async {
-        let mut reader = stream.reader().lock().await;
-        let mut buffer = [0; 8192];
-        loop {
-            let n = reader.read(&mut buffer).await?;
-            if n == 0 {
-                return Ok::<_, AnyTlsError>(());
+    let result = {
+        let to_outbound = async {
+            let mut reader = stream.reader().lock().await;
+            let mut buffer = [0; 8192];
+            loop {
+                let n = reader.read(&mut buffer).await?;
+                if n == 0 {
+                    outbound_write.shutdown().await?;
+                    return Ok::<_, AnyTlsError>(());
+                }
+                outbound_write.write_all(&buffer[..n]).await?;
+                bytes_to_outbound += n as u64;
             }
-            outbound_write.write_all(&buffer[..n]).await?;
-            bytes_to_outbound += n as u64;
-        }
-    };
-    let to_client = async {
-        let mut buffer = [0; 8192];
-        loop {
-            let n = outbound_read.read(&mut buffer).await?;
-            if n == 0 {
-                return Ok::<_, AnyTlsError>(());
+        };
+        let to_client = async {
+            let mut buffer = [0; 8192];
+            loop {
+                let n = outbound_read.read(&mut buffer).await?;
+                if n == 0 {
+                    return Ok::<_, AnyTlsError>(());
+                }
+                stream
+                    .send_data(Bytes::copy_from_slice(&buffer[..n]))
+                    .await
+                    .map_err(|_| AnyTlsError::SessionClosed)?;
+                bytes_to_client += n as u64;
             }
-            stream
-                .send_data(Bytes::copy_from_slice(&buffer[..n]))
-                .await
-                .map_err(|_| AnyTlsError::SessionClosed)?;
-            bytes_to_client += n as u64;
+        };
+        tokio::pin!(to_outbound, to_client);
+        tokio::select! {
+            biased;
+            // Stop delivering responses after peer FIN, but drain the bytes that
+            // arrived before it. The outer handler bounds this by one second.
+            _ = stream.closed() => to_outbound.await,
+            result = &mut to_outbound => result,
+            result = &mut to_client => result,
         }
-    };
-    let result = tokio::select! {
-        result = to_outbound => result,
-        result = to_client => result,
     };
     tracing::debug!(stream_id = stream.id(), host = %destination.addr,
         port = destination.port, bytes_to_outbound, bytes_to_client, "Proxy connection closed");
