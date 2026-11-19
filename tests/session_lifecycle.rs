@@ -50,6 +50,63 @@ impl AsyncWrite for BlockedWriter {
     }
 }
 
+struct InterruptibleShutdown {
+    calls: Arc<std::sync::atomic::AtomicUsize>,
+    started: Arc<Notify>,
+}
+
+impl AsyncWrite for InterruptibleShutdown {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        _: &mut Context<'_>,
+        data: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Poll::Ready(Ok(data.len()))
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+        if self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+            self.started.notify_one();
+            Poll::Pending
+        } else {
+            Poll::Ready(Ok(()))
+        }
+    }
+}
+
+#[tokio::test]
+async fn concurrent_close_waits_and_cancelled_cleanup_can_be_retried() {
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let started = Arc::new(Notify::new());
+    let session = Arc::new(Session::new_server(
+        empty(),
+        InterruptibleShutdown {
+            calls: calls.clone(),
+            started: started.clone(),
+        },
+        PaddingFactory::default(),
+    ));
+    let first = tokio::spawn({
+        let session = session.clone();
+        async move { session.close().await }
+    });
+    timeout(DEADLINE, started.notified()).await.unwrap();
+    assert!(
+        timeout(Duration::from_millis(20), session.close())
+            .await
+            .is_err(),
+        "a concurrent close must wait for in-progress cleanup"
+    );
+    first.abort();
+    assert!(first.await.unwrap_err().is_cancelled());
+    timeout(DEADLINE, session.close()).await.unwrap().unwrap();
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+}
+
 #[tokio::test]
 async fn failed_transport_write_closes_without_locking_itself() {
     let session = Session::new_server(empty(), FailingWriter, PaddingFactory::default());

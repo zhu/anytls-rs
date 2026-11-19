@@ -85,6 +85,7 @@ pub struct Session {
     // Heartbeat configuration (client side)
     heartbeat: Option<Arc<HeartbeatState>>,
     close_notify: watch::Sender<bool>,
+    close_complete: tokio::sync::Mutex<bool>,
 }
 
 impl Session {
@@ -151,6 +152,7 @@ impl Session {
             server_settings: None,
             heartbeat: heartbeat_state,
             close_notify: watch::channel(false).0,
+            close_complete: tokio::sync::Mutex::new(false),
         }
     }
 
@@ -187,6 +189,7 @@ impl Session {
             server_settings: None,
             heartbeat: None,
             close_notify: watch::channel(false).0,
+            close_complete: tokio::sync::Mutex::new(false),
         }
     }
 
@@ -233,13 +236,17 @@ impl Session {
 
     /// Close the session
     pub async fn close(&self) -> Result<()> {
-        let already_closed = self
-            .is_closed
-            .swap(true, std::sync::atomic::Ordering::Relaxed);
-        if already_closed {
+        self.is_closed
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.close_notify.send_replace(true);
+
+        // A close notification means cancellation has started, not that cleanup
+        // has finished. Serialize concurrent closers and leave this false if a
+        // closer is cancelled, allowing the next caller to finish the work.
+        let mut complete = self.close_complete.lock().await;
+        if *complete {
             return Ok(());
         }
-        self.close_notify.send_replace(true);
 
         // Dropping a receiver that has not been started also releases queued
         // data and wakes blocked stream writers. An active processor observes
@@ -250,11 +257,15 @@ impl Session {
         }
         self.buffer.lock().await.clear();
 
-        let streams: Vec<_> = self.streams.write().await.drain().map(|(_, s)| s).collect();
-        self.stream_receive_tx.write().await.clear();
-        for stream in streams {
-            stream.close_locally(AnyTlsError::SessionClosed);
+        {
+            let mut streams = self.streams.write().await;
+            for (_, stream) in streams.drain() {
+                // No await between removal and marking closed: cancellation
+                // must not strand externally held stream handles.
+                stream.close_locally(AnyTlsError::SessionClosed);
+            }
         }
+        self.stream_receive_tx.write().await.clear();
 
         // Include lock acquisition in the timeout. In-flight writes are
         // cancelled above and release the writer before shutdown starts.
@@ -268,6 +279,7 @@ impl Session {
             Err(_) => tracing::debug!(session_id = self.id, "Writer shutdown timed out"),
         }
 
+        *complete = true;
         Ok(())
     }
 
