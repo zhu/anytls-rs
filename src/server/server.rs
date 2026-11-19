@@ -7,17 +7,27 @@ use crate::util::{
     AnyTlsError, Result, StringMap, authenticate_client, configure_tcp_stream, hash_password,
 };
 use std::sync::{Arc, RwLock};
+use std::time::Duration;
 use tokio::net::TcpListener;
+use tokio::sync::{Semaphore, mpsc};
+use tokio::task::JoinSet;
 use tokio_rustls::TlsAcceptor;
-use tracing::{Instrument, Span, field, info_span};
+use tracing::{Instrument, field, info_span};
+
+const DEFAULT_MAX_CONNECTIONS: usize = 1024;
+const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
+
+type StreamCallback = Arc<dyn Fn(Arc<crate::session::Stream>) + Send + Sync + 'static>;
 
 /// Server manages AnyTLS server connections
 pub struct Server {
     password_hash: [u8; 32],
     tls_config: Arc<RwLock<Arc<TlsAcceptor>>>,
     padding: Arc<PaddingFactory>,
-    on_new_stream: Option<Arc<dyn Fn(Arc<crate::session::Stream>) + Send + Sync + 'static>>,
+    on_new_stream: Option<StreamCallback>,
     server_settings: Option<StringMap>,
+    connection_limit: Arc<Semaphore>,
+    handshake_timeout: Duration,
 }
 
 impl Server {
@@ -36,6 +46,8 @@ impl Server {
             padding,
             on_new_stream: None,
             server_settings,
+            connection_limit: Arc::new(Semaphore::new(DEFAULT_MAX_CONNECTIONS)),
+            handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
         }
     }
 
@@ -54,6 +66,8 @@ impl Server {
             padding,
             on_new_stream: None,
             server_settings,
+            connection_limit: Arc::new(Semaphore::new(DEFAULT_MAX_CONNECTIONS)),
+            handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
         }
     }
 
@@ -66,46 +80,70 @@ impl Server {
         self
     }
 
-    /// Start the server and listen for connections
+    /// Configure the maximum live connections and the combined TLS/auth deadline.
+    pub fn with_connection_limits(
+        mut self,
+        max_connections: usize,
+        handshake_timeout: Duration,
+    ) -> Result<Self> {
+        if max_connections == 0 || max_connections > Semaphore::MAX_PERMITS {
+            return Err(AnyTlsError::Config(
+                "max_connections is out of range".into(),
+            ));
+        }
+        if handshake_timeout.is_zero() {
+            return Err(AnyTlsError::Config(
+                "handshake_timeout must be positive".into(),
+            ));
+        }
+        self.connection_limit = Arc::new(Semaphore::new(max_connections));
+        self.handshake_timeout = handshake_timeout;
+        Ok(self)
+    }
+
+    /// Start the server and listen for connections.
     pub async fn listen(&self, addr: &str) -> Result<()> {
-        let listener = TcpListener::bind(addr).await?;
+        self.serve(TcpListener::bind(addr).await?).await
+    }
 
-        tracing::info!("[Server] Listening on {}", addr);
-
+    /// Serve an existing listener. Dropping this future cancels its connections.
+    pub async fn serve(&self, listener: TcpListener) -> Result<()> {
+        tracing::info!("[Server] Listening on {}", listener.local_addr()?);
+        let mut connections = JoinSet::new();
         loop {
-            match listener.accept().await {
-                Ok((stream, addr)) => {
+            tokio::select! {
+                result = connections.join_next(), if !connections.is_empty() => {
+                    if let Some(Err(error)) = result {
+                        tracing::error!("[Server] Connection task failed: {}", error);
+                    }
+                }
+                accepted = listener.accept() => {
+                    let (stream, addr) = accepted?;
+                    let Ok(permit) = self.connection_limit.clone().try_acquire_owned() else {
+                        tracing::debug!("[Server] Connection limit reached; rejecting {}", addr);
+                        continue;
+                    };
                     let tls_config = self.tls_config.read().unwrap().clone();
                     let password_hash = self.password_hash;
                     let padding = Arc::clone(&self.padding);
                     let on_new_stream = self.on_new_stream.clone();
                     let server_settings = self.server_settings.clone();
+                    let handshake_timeout = self.handshake_timeout;
                     let span = info_span!(
                         "anytls.connection",
                         peer_addr = %addr,
                         session_id = field::Empty
                     );
-
-                    tokio::spawn(
-                        async move {
-                            if let Err(e) = handle_connection(
-                                stream,
-                                tls_config,
-                                password_hash,
-                                padding,
-                                on_new_stream,
-                                server_settings,
-                            )
-                            .await
-                            {
-                                tracing::error!("[Server] Connection error: {}", e);
-                            }
+                    connections.spawn(async move {
+                        // The permit covers TLS, authentication, and the complete session.
+                        let _permit = permit;
+                        if let Err(error) = handle_connection(
+                            stream, tls_config, password_hash, padding, on_new_stream,
+                            server_settings, handshake_timeout,
+                        ).await {
+                            tracing::debug!("[Server] Connection ended: {}", error);
                         }
-                        .instrument(span),
-                    );
-                }
-                Err(e) => {
-                    tracing::error!("[Server] Accept error: {}", e);
+                    }.instrument(span));
                 }
             }
         }
@@ -118,8 +156,9 @@ async fn handle_connection(
     tls_config: Arc<TlsAcceptor>,
     password_hash: [u8; 32],
     padding: Arc<PaddingFactory>,
-    on_new_stream: Option<Arc<dyn Fn(Arc<crate::session::Stream>) + Send + Sync + 'static>>,
+    on_new_stream: Option<StreamCallback>,
     server_settings: Option<StringMap>,
+    handshake_timeout: Duration,
 ) -> Result<()> {
     let peer_addr = tcp_stream
         .peer_addr()
@@ -133,34 +172,37 @@ async fn handle_connection(
         tls_version = field::Empty,
         cipher_suite = field::Empty
     );
-    let _handshake_guard = handshake_span.enter();
     tracing::info!("[Server] New connection from {}", peer_addr);
-    // Perform TLS handshake
-    tracing::debug!("[Server] Starting TLS handshake");
-    let tls_stream = tls_config.accept(tcp_stream).await.map_err(|e| {
-        tracing::error!("[Server] TLS handshake failed: {}", e);
-        AnyTlsError::Tls(format!("TLS handshake failed: {}", e))
-    })?;
-    tracing::debug!("[Server] TLS handshake successful");
-    let (_, server_connection) = tls_stream.get_ref();
-    if let Some(protocol) = server_connection.protocol_version() {
-        handshake_span.record("tls_version", field::display(format!("{:?}", protocol)));
-    }
-    if let Some(suite) = server_connection.negotiated_cipher_suite() {
-        handshake_span.record(
-            "cipher_suite",
-            field::display(format!("{:?}", suite.suite())),
-        );
-    }
-
-    // Authenticate client
-    tracing::debug!("[Server] Authenticating client");
-    let (mut reader, writer) = tokio::io::split(tls_stream);
-    authenticate_client(&mut reader, &password_hash, &padding).await?;
-    tracing::debug!("[Server] Client authenticated");
+    let (reader, writer) = tokio::time::timeout(
+        handshake_timeout,
+        async {
+            let tls_stream = tls_config
+                .accept(tcp_stream)
+                .await
+                .map_err(|error| AnyTlsError::Tls(format!("TLS handshake failed: {}", error)))?;
+            let (_, connection) = tls_stream.get_ref();
+            if let Some(protocol) = connection.protocol_version() {
+                handshake_span.record("tls_version", field::debug(protocol));
+            }
+            if let Some(suite) = connection.negotiated_cipher_suite() {
+                handshake_span.record("cipher_suite", field::debug(suite.suite()));
+            }
+            let (mut reader, writer) = tokio::io::split(tls_stream);
+            authenticate_client(&mut reader, &password_hash, &padding).await?;
+            Ok::<_, AnyTlsError>((reader, writer))
+        }
+        .instrument(handshake_span.clone()),
+    )
+    .await
+    .map_err(|_| {
+        AnyTlsError::Io(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "TLS/authentication deadline exceeded",
+        ))
+    })??;
 
     // Create callback channel for new streams
-    let (stream_callback_tx, mut stream_callback_rx) =
+    let (stream_callback_tx, stream_callback_rx) =
         tokio::sync::mpsc::unbounded_channel::<Arc<crate::session::Stream>>();
 
     // Create server session
@@ -172,7 +214,7 @@ async fn handle_connection(
 
     let session = Arc::new(session);
     let session_id = session.id();
-    Span::current().record("session_id", session_id);
+    tracing::Span::current().record("session_id", session_id);
     handshake_span.record("session_id", field::display(session_id));
 
     tracing::info!(
@@ -182,126 +224,241 @@ async fn handle_connection(
         session_id
     );
 
-    // Handle new streams in a task
-    if let Some(callback) = on_new_stream {
-        tracing::debug!("[Server] Using custom stream callback");
-        tokio::spawn(async move {
-            while let Some(stream) = stream_callback_rx.recv().await {
-                tracing::debug!(
-                    "[Server] Received stream {} in custom callback",
-                    stream.id()
-                );
-                // Spawn a new task for each stream to handle it asynchronously
-                let stream_clone = Arc::clone(&stream);
-                let callback_clone = Arc::clone(&callback);
-                let stream_id = stream_clone.id();
-                let stream_span =
-                    info_span!("anytls.stream.callback", session_id = session_id, stream_id);
-                tokio::spawn(
-                    async move {
-                        callback_clone(stream_clone);
-                    }
-                    .instrument(stream_span),
-                );
+    run_session(session, stream_callback_rx, on_new_stream).await
+}
+
+/// Own every task for this connection so a closed peer cannot retain its session.
+async fn run_session(
+    session: Arc<Session>,
+    stream_callback_rx: mpsc::UnboundedReceiver<Arc<crate::session::Stream>>,
+    callback: Option<StreamCallback>,
+) -> Result<()> {
+    let mut tasks = JoinSet::new();
+    let receiver = session.clone();
+    tasks.spawn(async move { receiver.recv_loop().await });
+    let writer = session.clone();
+    tasks.spawn(async move { writer.process_stream_data().await });
+    tasks.spawn(run_stream_handlers(
+        session.clone(),
+        stream_callback_rx,
+        callback,
+    ));
+
+    let result = tokio::select! {
+        _ = session.closed() => Ok(()),
+        result = tasks.join_next() => match result {
+            Some(Ok(result)) => result,
+            Some(Err(error)) => Err(AnyTlsError::Io(std::io::Error::other(error))),
+            None => Ok(()),
+        }
+    };
+    // close() cancels blocked reads/writes and wakes every live stream.
+    session.close().await?;
+    tasks.abort_all();
+    while tasks.join_next().await.is_some() {}
+    match result {
+        Err(AnyTlsError::SessionClosed) => Ok(()),
+        other => other,
+    }
+}
+
+async fn run_stream_handlers(
+    session: Arc<Session>,
+    mut streams: mpsc::UnboundedReceiver<Arc<crate::session::Stream>>,
+    callback: Option<StreamCallback>,
+) -> Result<()> {
+    let mut handlers = JoinSet::new();
+    loop {
+        tokio::select! {
+            _ = session.closed() => return Ok(()),
+            result = handlers.join_next(), if !handlers.is_empty() => {
+                if let Some(Err(error)) = result {
+                    tracing::error!("[Server] Stream task failed: {}", error);
+                }
             }
-        });
-    } else {
-        // Use default TCP proxy handler if no callback is provided
-        tracing::debug!("[Server] Using default TCP proxy handler");
-        let session_for_handler = Arc::clone(&session);
-        tokio::spawn(async move {
-            while let Some(stream) = stream_callback_rx.recv().await {
-                tracing::debug!(
-                    "[Server] Received stream {} for default handler",
-                    stream.id()
-                );
-                let stream_clone = Arc::clone(&stream);
-                let session_clone = Arc::clone(&session_for_handler);
-                // Create a new handler instance for each stream (TcpProxyHandler is small and stateless)
-                let handler = TcpProxyHandler::new();
-                let stream_id = stream_clone.id();
-                let stream_span = info_span!(
-                    "anytls.stream.proxy",
-                    session_id = session_clone.id(),
-                    stream_id
-                );
-                tokio::spawn(
-                    async move {
-                        if let Err(e) = handler.handle_stream(stream_clone, session_clone).await {
-                            tracing::error!("[Proxy] Handler error: {}", e);
-                        }
+            stream = streams.recv() => {
+                let Some(stream) = stream else { return Ok(()); };
+                let session = session.clone();
+                let callback = callback.clone();
+                let span = info_span!("anytls.stream.proxy", session_id = session.id(), stream_id = stream.id());
+                handlers.spawn(async move {
+                    if let Some(callback) = callback {
+                        callback(stream);
+                    } else if let Err(error) = TcpProxyHandler::new().handle_stream(stream, session).await {
+                        tracing::debug!("[Proxy] Handler ended: {}", error);
                     }
-                    .instrument(stream_span),
-                );
+                }.instrument(span));
             }
-        });
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::util::{create_server_config, generate_key_pair};
+    use rustls::pki_types::ServerName;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt, duplex, sink};
+    use tokio::net::TcpStream;
+    use tokio::time::timeout;
+    use tokio_rustls::TlsConnector;
+
+    const TEST_DEADLINE: Duration = Duration::from_secs(3);
+
+    fn server() -> Server {
+        Server::new(
+            "test-password",
+            Arc::new(TlsAcceptor::from(create_server_config().unwrap())),
+            PaddingFactory::default(),
+            None,
+        )
     }
 
-    // Start receive loop
-    tracing::debug!("[Server] Starting receive loop");
-    let session_clone = Arc::clone(&session);
-    let recv_span = info_span!(
-        "anytls.session.recv_loop",
-        session_id = session_clone.id(),
-        peer_addr = %peer_addr
-    );
-    tokio::spawn(
-        async move {
-            tracing::debug!("[Server] recv_loop task spawned");
-            match session_clone.recv_loop().await {
-                Ok(()) => {
-                    tracing::debug!("[Server] recv_loop task completed normally");
-                }
-                Err(AnyTlsError::Io(e)) => {
-                    // Check if this is a close_notify error (normal connection close)
-                    let error_msg = e.to_string();
-                    if error_msg.contains("close_notify")
-                        || error_msg.contains("unexpected EOF")
-                        || e.kind() == std::io::ErrorKind::UnexpectedEof
-                    {
-                        tracing::debug!(
-                            "[Server] recv_loop task ended: Connection closed by client (no close_notify) - this is normal"
-                        );
-                    } else {
-                        tracing::error!("[Server] recv_loop task error: {}", e);
-                    }
-                }
-                Err(AnyTlsError::SessionClosed) => {
-                    tracing::debug!("[Server] recv_loop task ended: Session closed");
-                }
-                Err(e) => {
-                    tracing::error!("[Server] recv_loop task error: {}", e);
-                }
+    #[tokio::test]
+    async fn incomplete_tls_handshake_has_a_deadline() {
+        let server = server();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (tcp, _) = listener.accept().await.unwrap();
+        let result = timeout(
+            TEST_DEADLINE,
+            handle_connection(
+                tcp,
+                server.tls_config.read().unwrap().clone(),
+                server.password_hash,
+                server.padding,
+                None,
+                None,
+                Duration::from_millis(50),
+            ),
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(result, Err(AnyTlsError::Io(error)) if error.kind() == std::io::ErrorKind::TimedOut)
+        );
+        assert_eq!(
+            timeout(TEST_DEADLINE, client.read(&mut [0]))
+                .await
+                .unwrap()
+                .unwrap(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn completed_tls_without_authentication_has_a_deadline() {
+        let (cert, key) = generate_key_pair().unwrap();
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(cert.clone()).unwrap();
+        let client_config = rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let server_config = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert], key)
+            .unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let tcp = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (accepted, _) = listener.accept().await.unwrap();
+        let handler = tokio::spawn(handle_connection(
+            accepted,
+            Arc::new(TlsAcceptor::from(Arc::new(server_config))),
+            hash_password("test-password"),
+            PaddingFactory::default(),
+            None,
+            None,
+            Duration::from_millis(500),
+        ));
+        let connector = TlsConnector::from(Arc::new(client_config));
+        let _tls = connector
+            .connect(ServerName::try_from("localhost").unwrap(), tcp)
+            .await
+            .unwrap();
+        let result = timeout(TEST_DEADLINE, handler).await.unwrap().unwrap();
+        assert!(
+            matches!(result, Err(AnyTlsError::Io(error)) if error.kind() == std::io::ErrorKind::TimedOut)
+        );
+    }
+
+    #[tokio::test]
+    async fn peer_eof_releases_session_and_callback_cycle() {
+        let (reader, mut peer) = duplex(64);
+        let (tx, rx) = mpsc::unbounded_channel();
+        let mut session = Session::new_server(reader, sink(), PaddingFactory::default());
+        session.set_stream_callback(tx);
+        let session = Arc::new(session);
+        let weak = Arc::downgrade(&session);
+        let handler = tokio::spawn(run_session(session, rx, None));
+        peer.shutdown().await.unwrap();
+        timeout(TEST_DEADLINE, handler)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(
+            weak.upgrade().is_none(),
+            "server tasks retained a closed session"
+        );
+    }
+
+    async fn wait_for_permits(server: &Server, count: usize) {
+        timeout(TEST_DEADLINE, async {
+            while server.connection_limit.available_permits() != count {
+                tokio::task::yield_now().await;
             }
-        }
-        .instrument(recv_span),
-    );
+        })
+        .await
+        .unwrap();
+    }
 
-    // Start stream data processing
-    tracing::debug!("[Server] Starting stream data processing");
-    let session_clone = Arc::clone(&session);
-    let process_span = info_span!(
-        "anytls.session.process_stream_data",
-        session_id = session_clone.id(),
-        peer_addr = %peer_addr
-    );
-    tokio::spawn(
-        async move {
-            tracing::debug!("[Server] process_stream_data task spawned");
-            if let Err(e) = session_clone.process_stream_data().await {
-                tracing::error!("[Server] process_stream_data task error: {}", e);
-            } else {
-                tracing::debug!("[Server] process_stream_data task completed normally");
-            }
-        }
-        .instrument(process_span),
-    );
-
-    tracing::debug!("[Server] Connection handler setup complete");
-
-    // Wait for connection to close
-    // The connection will be managed by the spawned tasks
-    // In a production implementation, we'd wait for the session to close
-
-    Ok(())
+    #[tokio::test]
+    async fn connection_limit_rejects_excess_and_recovers_after_timeout() {
+        let server = Arc::new(
+            server()
+                .with_connection_limits(1, Duration::from_millis(500))
+                .unwrap(),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let serving = tokio::spawn({
+            let server = server.clone();
+            async move { server.serve(listener).await }
+        });
+        let mut first = TcpStream::connect(address).await.unwrap();
+        wait_for_permits(&server, 0).await;
+        let mut excess = TcpStream::connect(address).await.unwrap();
+        assert_eq!(
+            timeout(TEST_DEADLINE, excess.read(&mut [0]))
+                .await
+                .unwrap()
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            timeout(TEST_DEADLINE, first.read(&mut [0]))
+                .await
+                .unwrap()
+                .unwrap(),
+            0
+        );
+        wait_for_permits(&server, 1).await;
+        let mut next = TcpStream::connect(address).await.unwrap();
+        wait_for_permits(&server, 0).await;
+        // Dropping the serving future also owns and cancels accepted connections.
+        serving.abort();
+        let _ = serving.await;
+        wait_for_permits(&server, 1).await;
+        assert_eq!(
+            timeout(TEST_DEADLINE, next.read(&mut [0]))
+                .await
+                .unwrap()
+                .unwrap(),
+            0
+        );
+    }
 }

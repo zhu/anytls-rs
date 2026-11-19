@@ -34,6 +34,8 @@ async fn main() -> Result<()> {
     let mut show_cert_info = false;
     let mut expiry_warning_days: u64 = 30;
     let mut dns_servers: Vec<String> = Vec::new();
+    let mut max_connections = 1024;
+    let mut handshake_timeout_secs = 15;
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -97,6 +99,18 @@ async fn main() -> Result<()> {
                     .context("Expected days after --expiry-warning-days")?;
                 expiry_warning_days = parse_u64(&value, "--expiry-warning-days")?;
             }
+            "--max-connections" => {
+                let value = args
+                    .next()
+                    .context("Expected count after --max-connections")?;
+                max_connections = parse_usize(&value, "--max-connections")?;
+            }
+            "--handshake-timeout" => {
+                let value = args
+                    .next()
+                    .context("Expected seconds after --handshake-timeout")?;
+                handshake_timeout_secs = parse_u64(&value, "--handshake-timeout")?;
+            }
             "--dns" => {
                 let value = args.next().context("Expected DNS server after --dns")?;
                 dns_servers.extend(parse_dns_entries(&value));
@@ -121,6 +135,12 @@ async fn main() -> Result<()> {
                     "  -T, --idle-session-timeout SECS         Hint for clients (default: 60)"
                 );
                 println!("  -M, --min-idle-session COUNT            Hint for clients (default: 1)");
+                println!(
+                    "      --max-connections COUNT  Maximum live TLS sessions (default: 1024)"
+                );
+                println!(
+                    "      --handshake-timeout SECS  Combined TLS/auth deadline (default: 15)"
+                );
                 println!(
                     "  -L, --log-level LEVEL     Log level: error|warn|info|debug|trace (default: info)"
                 );
@@ -244,7 +264,8 @@ async fn main() -> Result<()> {
 
     // Create and start server
     let server =
-        Server::new_with_reloadable_tls(&password, tls_acceptor_ref, padding, server_settings);
+        Server::new_with_reloadable_tls(&password, tls_acceptor_ref, padding, server_settings)
+            .with_connection_limits(max_connections, Duration::from_secs(handshake_timeout_secs))?;
 
     if let Some(ref reloader) = cert_reloader {
         if watch_cert {
