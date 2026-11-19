@@ -252,22 +252,40 @@ async fn unconnected_v2_switches_families_and_preserves_large_datagrams() {
     proxy.send(&request, 1).await;
 
     for (socket, payload) in [
-        (&ipv4, b"ipv4-first".to_vec()),
-        (&ipv6, vec![0x5a; 65_527]),
-        (&ipv4, b"ipv4-again".to_vec()),
+        (&ipv4, b"ipv4-first".as_slice()),
+        (&ipv6, b"ipv6-second"),
+        (&ipv4, b"ipv4-again"),
     ] {
         let wire = packet(
             Some(ip_address(socket.local_addr().unwrap(), false)),
-            &payload,
+            payload,
         );
-        if payload.len() > 65_000 {
-            // IPv6 source + UoT length + maximum UDP payload exceeds one PSH.
-            assert!(wire.len() > u16::MAX as usize);
-        }
         proxy.send(&wire, 4093).await;
-        echo(socket, &payload).await;
+        echo(socket, payload).await;
         proxy.expect(&wire).await;
     }
+
+    // Some systems configure a smaller UDP datagram ceiling. Confirm the OS
+    // accepts the maximum IPv6 payload before requiring the relay to carry it.
+    let maximum_payload = vec![0x5a; 65_527];
+    let ipv6_address = ipv6.local_addr().unwrap();
+    match bounded(ipv6.send_to(&maximum_payload, ipv6_address)).await {
+        Ok(length) => {
+            assert_eq!(length, maximum_payload.len());
+            assert_eq!(receive(&ipv6, &maximum_payload).await, ipv6_address);
+        }
+        Err(error) => {
+            eprintln!("skipping maximum IPv6 UDP payload: OS limit: {error}");
+            proxy.finish().await.unwrap();
+            return;
+        }
+    }
+    let wire = packet(Some(ip_address(ipv6_address, false)), &maximum_payload);
+    // IPv6 source + UoT length + maximum UDP payload exceeds one PSH.
+    assert!(wire.len() > u16::MAX as usize);
+    proxy.send(&wire, 4093).await;
+    echo(&ipv6, &maximum_payload).await;
+    proxy.expect(&wire).await;
     proxy.finish().await.unwrap();
 }
 
