@@ -9,7 +9,7 @@ use md5;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::sync::{Notify, RwLock, mpsc};
+use tokio::sync::{RwLock, mpsc, watch};
 use tokio::time::{self, Duration, Instant, MissedTickBehavior};
 use tracing::{field, info_span};
 
@@ -82,7 +82,7 @@ pub struct Session {
 
     // Heartbeat configuration (client side)
     heartbeat: Option<Arc<HeartbeatState>>,
-    close_notify: Arc<Notify>,
+    close_notify: watch::Sender<bool>,
 }
 
 impl Session {
@@ -146,7 +146,7 @@ impl Session {
             on_new_stream: None,
             server_settings: None,
             heartbeat: heartbeat_state,
-            close_notify: Arc::new(Notify::new()),
+            close_notify: watch::channel(false).0,
         }
     }
 
@@ -180,7 +180,7 @@ impl Session {
             on_new_stream: None,
             server_settings: None,
             heartbeat: None,
-            close_notify: Arc::new(Notify::new()),
+            close_notify: watch::channel(false).0,
         }
     }
 
@@ -209,6 +209,12 @@ impl Session {
         self.is_closed.load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// Wait until the session closes, including when it closed before this call.
+    pub async fn closed(&self) {
+        let mut closed = self.close_notify.subscribe();
+        let _ = closed.wait_for(|closed| *closed).await;
+    }
+
     /// Whether the session currently carries any open streams.
     ///
     /// Used by the session pool's cleanup task to avoid closing a pooled
@@ -227,39 +233,34 @@ impl Session {
         if already_closed {
             return Ok(());
         }
-        self.close_notify.notify_waiters();
+        self.close_notify.send_replace(true);
 
-        // Close stream data receiver so process_stream_data exits
-        // Close all streams and notify pending waiters
-        {
-            let mut streams = self.streams.write().await;
-            let mut receive_map = self.stream_receive_tx.write().await;
-            for (stream_id, stream) in streams.drain() {
-                stream.close_with_error(AnyTlsError::SessionClosed).await;
-                stream.notify_synack(Err(AnyTlsError::SessionClosed)).await;
-                receive_map.remove(&stream_id);
-            }
+        // Dropping a receiver that has not been started also releases queued
+        // data and wakes blocked stream writers. An active processor observes
+        // the durable close notification and drops its receiver itself.
+        self.stream_data_rx.lock().await.take();
+        if let Some(callback) = &self.on_new_stream {
+            callback.lock().await.take();
+        }
+        self.buffer.lock().await.clear();
+
+        let streams: Vec<_> = self.streams.write().await.drain().map(|(_, s)| s).collect();
+        self.stream_receive_tx.write().await.clear();
+        for stream in streams {
+            stream.close_with_error(AnyTlsError::SessionClosed).await;
+            stream.notify_synack(Err(AnyTlsError::SessionClosed)).await;
         }
 
-        // Attempt to shutdown writer gracefully
-        {
+        // Include lock acquisition in the timeout. In-flight writes are
+        // cancelled above and release the writer before shutdown starts.
+        let shutdown = async {
             let mut writer = self.writer.lock().await;
-            match time::timeout(Duration::from_secs(1), writer.shutdown()).await {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) => {
-                    tracing::debug!(
-                        session_id = self.id,
-                        "[Session] Writer shutdown failed during close: {}",
-                        e
-                    );
-                }
-                Err(_) => {
-                    tracing::debug!(
-                        session_id = self.id,
-                        "[Session] Writer shutdown timed out during close"
-                    );
-                }
-            }
+            writer.shutdown().await
+        };
+        match time::timeout(Duration::from_secs(1), shutdown).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => tracing::debug!(session_id = self.id, %e, "Writer shutdown failed"),
+            Err(_) => tracing::debug!(session_id = self.id, "Writer shutdown timed out"),
         }
 
         Ok(())
@@ -267,6 +268,12 @@ impl Session {
 
     /// Start the receive loop (should be run in a tokio task)
     pub async fn recv_loop(&self) -> Result<()> {
+        let result = self.recv_loop_inner().await;
+        let _ = self.close().await;
+        result
+    }
+
+    async fn recv_loop_inner(&self) -> Result<()> {
         let session_id = self.id();
         let role = if self.is_client { "client" } else { "server" };
         let recv_span = info_span!(
@@ -304,13 +311,15 @@ impl Session {
                 "[Session] recv_loop: Acquiring reader lock (iteration {})",
                 iteration
             );
-            let mut reader = self.reader.lock().await;
-            tracing::trace!(
-                session_id = session_id,
-                "[Session] recv_loop: Reader lock acquired, calling read_buf (iteration {})",
-                iteration
-            );
-            let n = match reader.read_buf(&mut buffer).await {
+            let read_result = tokio::select! {
+                biased;
+                _ = self.closed() => break,
+                result = async {
+                    let mut reader = self.reader.lock().await;
+                    reader.read_buf(&mut buffer).await
+                } => result,
+            };
+            let n = match read_result {
                 Ok(n) => {
                     tracing::trace!(
                         session_id = session_id,
@@ -344,7 +353,6 @@ impl Session {
                     }
                 }
             };
-            drop(reader);
             tracing::trace!(
                 session_id = session_id,
                 "[Session] recv_loop: Reader lock released (iteration {})",
@@ -487,7 +495,6 @@ impl Session {
                         return Err(AnyTlsError::SessionClosed);
                     }
 
-                    let close_notify = Arc::clone(&self.close_notify);
                     tokio::select! {
                         result = tx.send(frame.data) => {
                             match result {
@@ -510,7 +517,7 @@ impl Session {
                                 }
                             }
                         }
-                        _ = close_notify.notified() => {
+                        _ = self.closed() => {
                             tracing::debug!(
                                 session_id = session_id,
                                 "[Session] handle_frame: Session closed while sending {} bytes to stream {}",
@@ -883,6 +890,9 @@ impl Session {
 
     /// Write a frame to the connection
     pub async fn write_frame(&self, frame: Frame) -> Result<()> {
+        if self.is_closed() {
+            return Err(AnyTlsError::SessionClosed);
+        }
         use tokio_util::codec::Encoder;
         let frame_cmd = frame.cmd;
         let frame_stream_id = frame.stream_id;
@@ -959,7 +969,21 @@ impl Session {
     }
 
     /// Write buffer to connection with padding applied
-    async fn write_with_padding(&self, mut buffer: BytesMut) -> Result<()> {
+    async fn write_with_padding(&self, buffer: BytesMut) -> Result<()> {
+        let result = tokio::select! {
+            biased;
+            _ = self.closed() => return Err(AnyTlsError::SessionClosed),
+            result = self.write_with_padding_inner(buffer) => result,
+        };
+        // The inner future (and its writer guard) has been dropped before
+        // closing. Closing while holding that mutex would deadlock.
+        match result {
+            Ok(()) => Ok(()),
+            Err(error) => Err(self.handle_io_error("write_frame", error).await),
+        }
+    }
+
+    async fn write_with_padding_inner(&self, mut buffer: BytesMut) -> std::io::Result<()> {
         use crate::padding::CHECK_MARK;
         use crate::protocol::{Command, HEADER_OVERHEAD_SIZE};
         use bytes::BufMut;
@@ -972,10 +996,10 @@ impl Session {
             );
             let mut writer = self.writer.lock().await;
             if let Err(e) = writer.write_all(&buffer).await {
-                return Err(self.handle_io_error("write_without_padding", e).await);
+                return Err(e);
             }
             if let Err(e) = writer.flush().await {
-                return Err(self.handle_io_error("flush_without_padding", e).await);
+                return Err(e);
             }
             tracing::info!(
                 "[Session] write_with_padding: Successfully wrote {} bytes to connection",
@@ -1000,10 +1024,10 @@ impl Session {
             // For now, just write directly
             let mut writer = self.writer.lock().await;
             if let Err(e) = writer.write_all(&buffer).await {
-                return Err(self.handle_io_error("write_no_padding_stop", e).await);
+                return Err(e);
             }
             if let Err(e) = writer.flush().await {
-                return Err(self.handle_io_error("flush_no_padding_stop", e).await);
+                return Err(e);
             }
             return Ok(());
         }
@@ -1015,10 +1039,10 @@ impl Session {
         if pkt_sizes.is_empty() {
             let mut writer = self.writer.lock().await;
             if let Err(e) = writer.write_all(&buffer).await {
-                return Err(self.handle_io_error("write_no_padding_sizes", e).await);
+                return Err(e);
             }
             if let Err(e) = writer.flush().await {
-                return Err(self.handle_io_error("flush_no_padding_sizes", e).await);
+                return Err(e);
             }
             return Ok(());
         }
@@ -1061,7 +1085,7 @@ impl Session {
                     );
                 }
                 if let Err(e) = writer.write_all(&buffer[..size]).await {
-                    return Err(self.handle_io_error("write_padding_split_payload", e).await);
+                    return Err(e);
                 }
                 buffer = buffer.split_off(size);
             } else if remain_payload_len > 0 {
@@ -1082,7 +1106,7 @@ impl Session {
                 }
 
                 if let Err(e) = writer.write_all(&buffer).await {
-                    return Err(self.handle_io_error("write_padding_payload_frame", e).await);
+                    return Err(e);
                 }
                 buffer.clear();
             } else {
@@ -1094,7 +1118,7 @@ impl Session {
                 padding_frame.put_slice(&vec![0u8; size]); // padding data (zeros)
 
                 if let Err(e) = writer.write_all(&padding_frame).await {
-                    return Err(self.handle_io_error("write_padding_frame_only", e).await);
+                    return Err(e);
                 }
             }
         }
@@ -1106,13 +1130,13 @@ impl Session {
                 buffer.len()
             );
             if let Err(e) = writer.write_all(&buffer).await {
-                return Err(self.handle_io_error("write_remaining_payload", e).await);
+                return Err(e);
             }
         }
 
         tracing::trace!("[Session] write_with_padding: Flushing writer");
         if let Err(e) = writer.flush().await {
-            return Err(self.handle_io_error("flush_with_padding", e).await);
+            return Err(e);
         }
         tracing::debug!("[Session] write_with_padding: Successfully wrote and flushed data");
         Ok(())
@@ -1199,7 +1223,11 @@ impl Session {
                 ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
                 loop {
-                    ticker.tick().await;
+                    tokio::select! {
+                        biased;
+                        _ = session.closed() => break,
+                        _ = ticker.tick() => {}
+                    }
 
                     if session.is_closed() {
                         tracing::debug!(
@@ -1279,7 +1307,6 @@ impl Session {
         );
         let mut iteration = 0u64;
         let mut total_bytes_out: usize = 0;
-        let close_notify = Arc::clone(&self.close_notify);
         let receiver = {
             let mut guard = self.stream_data_rx.lock().await;
             guard.take()
@@ -1302,7 +1329,7 @@ impl Session {
             );
             let result = tokio::select! {
                 biased;
-                _ = close_notify.notified() => {
+                _ = self.closed() => {
                     tracing::debug!(
                         session_id = session_id,
                         "[Session] process_stream_data: Received close notification (iteration {})",
