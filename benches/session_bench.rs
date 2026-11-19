@@ -27,8 +27,8 @@ impl AsyncRead for MockStream {
         _cx: &mut std::task::Context<'_>,
         _buf: &mut tokio::io::ReadBuf<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
-        // Return EOF immediately (no data)
-        std::task::Poll::Ready(Ok(()))
+        // Keep the mock transport open until Session::close cancels its read.
+        std::task::Poll::Pending
     }
 }
 
@@ -114,7 +114,7 @@ fn bench_stream_creation(c: &mut Criterion) {
             .iter(|| async {
                 let session = create_test_session_async(true).await;
                 let session = Arc::new(session);
-                let _stream = session.open_stream().await;
+                let _stream = session.open_stream().await.unwrap();
                 black_box(_stream)
             })
     });
@@ -139,7 +139,21 @@ fn bench_session_startup_complete(c: &mut Criterion) {
                 let session = create_test_session_async(true).await;
                 let session = Arc::new(session);
                 // Start client session (sends Settings frame and starts background tasks)
-                let _ = session.clone().start_client().await;
+                session.clone().start_client().await.unwrap();
+                // Flush the startup Settings using a valid empty padding frame.
+                session.disable_buffering();
+                session
+                    .write_control_frame(Frame::control(Command::Waste, 0))
+                    .await
+                    .unwrap();
+                session.close().await.unwrap();
+                tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                    while Arc::strong_count(&session) > 1 {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("client startup workers did not stop");
                 black_box(session)
             })
     });
@@ -163,10 +177,11 @@ fn bench_frame_decode(c: &mut Criterion) {
             let mut buffer = encoded.clone();
             b.iter(|| {
                 let mut decode_codec = FrameCodec;
-                let result = decode_codec.decode(&mut buffer);
-                if let Ok(Some(frame)) = result {
-                    black_box(frame);
-                }
+                let frame = decode_codec
+                    .decode(&mut buffer)
+                    .unwrap()
+                    .expect("complete frame");
+                black_box(frame);
                 // Reset buffer for next iteration
                 buffer = encoded.clone();
             })
@@ -242,7 +257,7 @@ fn bench_session_write_frame(c: &mut Criterion) {
                     let session = create_test_session_async(true).await;
                     let session = Arc::new(session);
                     let frame = Frame::with_data(Command::Push, 1, Bytes::from(vec![0u8; size]));
-                    let _ = session.write_frame(frame).await;
+                    session.write_frame(frame).await.unwrap();
                     black_box(&session);
                 })
         });
@@ -264,7 +279,7 @@ fn bench_session_write_data_frame(c: &mut Criterion) {
                         let session = create_test_session_async(true).await;
                         let session = Arc::new(session);
                         let data = Bytes::from(vec![0u8; size]);
-                        let _ = session.write_data_frame(1, data).await;
+                        session.write_data_frame(1, data).await.unwrap();
                         black_box(&session);
                     })
             },
@@ -292,7 +307,7 @@ fn bench_session_control_frames(c: &mut Criterion) {
                     let session = create_test_session_async(true).await;
                     let session = Arc::new(session);
                     let frame = Frame::control(cmd, 1);
-                    let _ = session.write_control_frame(frame).await;
+                    session.write_control_frame(frame).await.unwrap();
                     black_box(&session);
                 })
         });
@@ -316,9 +331,8 @@ fn bench_session_multiple_streams(c: &mut Criterion) {
 
                         let mut streams = Vec::new();
                         for _ in 0..count {
-                            if let Ok((stream, _)) = session.open_stream().await {
-                                streams.push(stream);
-                            }
+                            let (stream, _) = session.open_stream().await.unwrap();
+                            streams.push(stream);
                         }
                         black_box(streams);
                     })
