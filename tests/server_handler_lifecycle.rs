@@ -2,7 +2,7 @@ use anytls_rs::padding::PaddingFactory;
 use anytls_rs::protocol::{Command, Frame, FrameCodec};
 use anytls_rs::server::handler::{StreamHandler, TcpProxyHandler};
 use anytls_rs::session::{Session, Stream};
-use anytls_rs::util::Result;
+use anytls_rs::util::{AnyTlsError, Result};
 use bytes::{Bytes, BytesMut};
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -110,32 +110,40 @@ impl Proxy {
     }
 
     async fn next_frame(&mut self) -> Frame {
-        timeout(DEADLINE, async {
+        timeout(DEADLINE, self.read_frame()).await.unwrap()
+    }
+
+    async fn read_frame(&mut self) -> Frame {
+        loop {
+            if let Some(frame) = FrameCodec.decode(&mut self.buffered).unwrap() {
+                return frame;
+            }
+            assert_ne!(
+                self.peer.read_buf(&mut self.buffered).await.unwrap(),
+                0,
+                "transport closed before FIN"
+            );
+        }
+    }
+
+    async fn until_fin(&mut self) -> Vec<Frame> {
+        self.until_fin_with_timeout(DEADLINE).await
+    }
+
+    async fn until_fin_with_timeout(&mut self, deadline: Duration) -> Vec<Frame> {
+        timeout(deadline, async {
+            let mut frames = Vec::new();
             loop {
-                if let Some(frame) = FrameCodec.decode(&mut self.buffered).unwrap() {
-                    return frame;
+                let frame = self.read_frame().await;
+                let done = frame.cmd == Command::Fin;
+                frames.push(frame);
+                if done {
+                    return frames;
                 }
-                assert_ne!(
-                    self.peer.read_buf(&mut self.buffered).await.unwrap(),
-                    0,
-                    "transport closed before FIN"
-                );
             }
         })
         .await
         .unwrap()
-    }
-
-    async fn until_fin(&mut self) -> Vec<Frame> {
-        let mut frames = Vec::new();
-        loop {
-            let frame = self.next_frame().await;
-            let done = frame.cmd == Command::Fin;
-            frames.push(frame);
-            if done {
-                return frames;
-            }
-        }
     }
 
     async fn finish(self) -> std::result::Result<Result<()>, tokio::task::JoinError> {
@@ -282,14 +290,21 @@ async fn refused_target_reports_synack_error_then_fin() {
     drop(target);
     let mut proxy = Proxy::new().await;
     proxy.send(&ipv4_address(address)).await;
-    let frames = proxy.until_fin().await;
+    // Windows need not report a closed loopback port within the ordinary 2s
+    // frame budget. Allow the production 15s dial deadline plus scheduling
+    // margin, but require an actual refusal rather than accepting its timeout.
+    let frames = proxy.until_fin_with_timeout(Duration::from_secs(17)).await;
     assert!(
         frames
             .iter()
             .any(|f| f.cmd == Command::SynAck && !f.data.is_empty())
     );
     assert_eq!(frames.last().unwrap().cmd, Command::Fin);
-    assert!(proxy.finish().await.unwrap().is_err());
+    let error = proxy.finish().await.unwrap().unwrap_err();
+    assert!(
+        matches!(&error, AnyTlsError::Io(io) if io.kind() == std::io::ErrorKind::ConnectionRefused),
+        "expected an actual connection refusal, got {error}"
+    );
 }
 
 #[tokio::test]
