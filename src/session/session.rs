@@ -691,13 +691,15 @@ impl Session {
                     frame.stream_id
                 );
                 let stream = self.streams.write().await.remove(&frame.stream_id);
+                // Notify before another await can cancel cleanup of a stream
+                // that has already left the session map.
+                if let Some(stream) = stream {
+                    stream.close_locally(AnyTlsError::Io(std::io::ErrorKind::BrokenPipe.into()));
+                }
                 self.stream_receive_tx
                     .write()
                     .await
                     .remove(&frame.stream_id);
-                if let Some(stream) = stream {
-                    stream.close_locally(AnyTlsError::Io(std::io::ErrorKind::BrokenPipe.into()));
-                }
             }
             Command::Settings => {
                 // Client settings (server side)
@@ -1397,11 +1399,13 @@ impl Session {
                             stream_id
                         );
                         let stream = self.streams.write().await.remove(&stream_id);
-                        self.stream_receive_tx.write().await.remove(&stream_id);
-                        if let Some(stream) = stream {
+                        if let Some(stream) = &stream {
                             stream.close_locally(AnyTlsError::Io(
                                 std::io::ErrorKind::BrokenPipe.into(),
                             ));
+                        }
+                        self.stream_receive_tx.write().await.remove(&stream_id);
+                        if stream.is_some() {
                             self.write_control_frame(Frame::control(Command::Fin, stream_id))
                                 .await?;
                         }
@@ -1502,6 +1506,43 @@ mod tests {
     fn create_test_padding() -> Arc<PaddingFactory> {
         use crate::padding::DEFAULT_PADDING_SCHEME;
         Arc::new(PaddingFactory::new(DEFAULT_PADDING_SCHEME.as_bytes()).unwrap())
+    }
+
+    #[tokio::test]
+    async fn fin_notifies_retained_stream_before_waiting_for_receiver_map() {
+        let session = Arc::new(Session::new_server(
+            tokio::io::empty(),
+            tokio::io::sink(),
+            create_test_padding(),
+        ));
+        session
+            .handle_frame(Frame::with_data(
+                Command::Settings,
+                0,
+                Bytes::from_static(b"v=2"),
+            ))
+            .await
+            .unwrap();
+        session
+            .handle_frame(Frame::control(Command::Syn, 1))
+            .await
+            .unwrap();
+        let stream = session.streams.read().await.get(&1).unwrap().clone();
+        let receive_guard = session.stream_receive_tx.write().await;
+        let handling_fin = tokio::spawn({
+            let session = session.clone();
+            async move { session.handle_frame(Frame::control(Command::Fin, 1)).await }
+        });
+        // Cleanup is deliberately blocked after map removal. A retained handle
+        // must already observe closure even if the handling task is cancelled.
+        tokio::time::timeout(Duration::from_secs(1), stream.closed())
+            .await
+            .unwrap();
+        handling_fin.abort();
+        let _ = handling_fin.await;
+        drop(receive_guard);
+        session.close().await.unwrap();
+        assert!(stream.is_closed());
     }
 
     #[tokio::test]
