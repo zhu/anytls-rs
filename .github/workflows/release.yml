@@ -28,7 +28,7 @@ jobs:
       tag: ${{ steps.version.outputs.tag }}
       archive_version: ${{ steps.version.outputs.archive_version }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
       - id: version
@@ -62,11 +62,11 @@ jobs:
     needs: prepare
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v6
         with:
           go-version: '1.24.x'
           cache-dependency-path: tests/interop/*/go.sum
@@ -159,7 +159,7 @@ jobs:
     
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
       
@@ -195,7 +195,7 @@ jobs:
           fi
       
       - name: Cache cargo registry
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/bin/
@@ -248,7 +248,7 @@ jobs:
           echo "ARTIFACT_PATH=${ARTIFACT_PATH}" >> $GITHUB_ENV
       
       - name: Upload artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.artifact_name }}-${{ needs.prepare.outputs.tag }}
           path: |
@@ -261,7 +261,7 @@ jobs:
     needs: [prepare, build]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v7
         with:
           path: artifacts
           pattern: anytls-*-${{ needs.prepare.outputs.tag }}
@@ -273,7 +273,7 @@ jobs:
             [ -f "$archive" ] || continue
             sha256sum "$archive" > "$archive.sha256"
           done
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: checksums-${{ needs.prepare.outputs.tag }}
           path: artifacts/*.sha256
@@ -287,13 +287,13 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v7
         with:
           path: artifacts
           pattern: anytls-*-${{ needs.prepare.outputs.tag }}
           merge-multiple: true
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v7
         with:
           path: checksums
           name: checksums-${{ needs.prepare.outputs.tag }}
@@ -317,7 +317,7 @@ jobs:
           Custom releases are distributed here, not through crates.io.
           NOTES
       - name: Publish tag and release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ needs.prepare.outputs.tag }}
           target_commitish: ${{ github.sha }}

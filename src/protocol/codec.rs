@@ -1,4 +1,6 @@
-use crate::protocol::frame::{Command, Frame, HEADER_OVERHEAD_SIZE, MAX_FRAME_PAYLOAD_SIZE};
+use crate::protocol::frame::{
+    Command, Frame, HEADER_OVERHEAD_SIZE, MAX_CONTROL_PAYLOAD_SIZE, MAX_FRAME_PAYLOAD_SIZE,
+};
 use bytes::{BufMut, Bytes, BytesMut};
 use std::io;
 use tokio_util::codec::{Decoder, Encoder};
@@ -40,6 +42,19 @@ impl Decoder for FrameCodec {
         let cmd = Command::from(cmd_byte);
         let stream_id = header_reader.get_u32();
         let data_len = header_reader.get_u16() as usize;
+
+        if !command_allows_payload(cmd) && data_len != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "control command must not contain a payload",
+            ));
+        }
+        if command_has_bounded_control_payload(cmd) && data_len > MAX_CONTROL_PAYLOAD_SIZE {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("control payload exceeds {MAX_CONTROL_PAYLOAD_SIZE} bytes"),
+            ));
+        }
 
         tracing::debug!(
             "[FrameCodec] decode: Parsing header (buffer had {} bytes, preview: {})",
@@ -97,10 +112,22 @@ impl Encoder<Frame> for FrameCodec {
 
     fn encode(&mut self, item: Frame, dst: &mut BytesMut) -> Result<(), Self::Error> {
         let data_len = item.data.len();
+        if !command_allows_payload(item.cmd) && data_len != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "control command must not contain a payload",
+            ));
+        }
+        if command_has_bounded_control_payload(item.cmd) && data_len > MAX_CONTROL_PAYLOAD_SIZE {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("control payload exceeds {MAX_CONTROL_PAYLOAD_SIZE} bytes"),
+            ));
+        }
         if data_len > MAX_FRAME_PAYLOAD_SIZE {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "frame payload exceeds 65535 bytes",
+                format!("frame payload exceeds {} bytes", MAX_FRAME_PAYLOAD_SIZE),
             ));
         }
 
@@ -119,6 +146,23 @@ impl Encoder<Frame> for FrameCodec {
 
         Ok(())
     }
+}
+
+fn command_allows_payload(cmd: Command) -> bool {
+    matches!(
+        cmd,
+        Command::Waste
+            | Command::Push
+            | Command::Settings
+            | Command::Alert
+            | Command::UpdatePaddingScheme
+            | Command::SynAck
+            | Command::ServerSettings
+    )
+}
+
+fn command_has_bounded_control_payload(cmd: Command) -> bool {
+    matches!(cmd, Command::Settings | Command::Alert | Command::SynAck)
 }
 
 #[cfg(test)]
@@ -170,5 +214,99 @@ mod tests {
 
         let result = codec.decode(&mut buf);
         assert!(result.unwrap().is_none()); // Should return None, not error
+    }
+
+    #[test]
+    fn bounded_control_payload_limit_is_checked_on_encode_and_decode() {
+        let mut codec = FrameCodec;
+        for cmd in [Command::Settings, Command::Alert, Command::SynAck] {
+            let accepted =
+                Frame::with_data(cmd, 0, Bytes::from(vec![0x41; MAX_CONTROL_PAYLOAD_SIZE]));
+            let mut wire = BytesMut::new();
+            codec.encode(accepted.clone(), &mut wire).unwrap();
+            assert_eq!(codec.decode(&mut wire).unwrap(), Some(accepted));
+
+            let oversized = Frame::with_data(
+                cmd,
+                0,
+                Bytes::from(vec![0x41; MAX_CONTROL_PAYLOAD_SIZE + 1]),
+            );
+            assert_eq!(
+                codec
+                    .encode(oversized, &mut BytesMut::new())
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::InvalidInput,
+                "{cmd:?} is bounded on encode"
+            );
+
+            let mut wire = BytesMut::new();
+            wire.put_u8(cmd.into());
+            wire.put_u32(0);
+            wire.put_u16((MAX_CONTROL_PAYLOAD_SIZE + 1) as u16);
+            assert_eq!(
+                codec.decode(&mut wire).unwrap_err().kind(),
+                io::ErrorKind::InvalidData,
+                "{cmd:?} is bounded on decode"
+            );
+            assert_eq!(
+                wire.len(),
+                HEADER_OVERHEAD_SIZE,
+                "invalid header remains unconsumed"
+            );
+        }
+    }
+
+    #[test]
+    fn large_payload_commands_use_the_full_u16_wire_limit() {
+        let mut codec = FrameCodec;
+        for cmd in [
+            Command::Waste,
+            Command::UpdatePaddingScheme,
+            Command::ServerSettings,
+        ] {
+            let frame = Frame::with_data(cmd, 0, Bytes::from(vec![0x5a; MAX_FRAME_PAYLOAD_SIZE]));
+            let mut wire = BytesMut::new();
+
+            codec.encode(frame.clone(), &mut wire).unwrap();
+
+            assert_eq!(wire.len(), HEADER_OVERHEAD_SIZE + MAX_FRAME_PAYLOAD_SIZE);
+            assert_eq!(codec.decode(&mut wire).unwrap(), Some(frame));
+            assert!(wire.is_empty());
+        }
+    }
+
+    #[test]
+    fn empty_control_commands_reject_payloads_on_encode_and_decode() {
+        let mut codec = FrameCodec;
+        for cmd in [
+            Command::Syn,
+            Command::Fin,
+            Command::HeartRequest,
+            Command::HeartResponse,
+        ] {
+            let frame = Frame::with_data(cmd, 1, Bytes::from_static(b"invalid"));
+            assert_eq!(
+                codec
+                    .encode(frame, &mut BytesMut::new())
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::InvalidInput
+            );
+
+            let mut wire = BytesMut::new();
+            wire.put_u8(cmd.into());
+            wire.put_u32(1);
+            wire.put_u16(1);
+            assert_eq!(
+                codec.decode(&mut wire).unwrap_err().kind(),
+                io::ErrorKind::InvalidData
+            );
+            assert_eq!(
+                wire.len(),
+                HEADER_OVERHEAD_SIZE,
+                "invalid header remains unconsumed"
+            );
+        }
     }
 }

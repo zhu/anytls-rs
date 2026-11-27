@@ -119,9 +119,10 @@ impl Stream {
 
     /// Close this stream and enqueue its FIN after all previously queued data.
     ///
-    /// Signals the owning session (via the writer channel's empty-`Bytes`
-    /// sentinel — see `Session::process_stream_data`) to emit a `Fin` frame
-    /// for this stream id and evict it from the session's stream maps.
+    /// Signals the owning session to emit a `Fin` frame for this stream id and
+    /// evict it from the session's stream maps. An empty `Bytes` value marks
+    /// the FIN in the internal writer channel; public empty data writes are
+    /// ignored before they reach that channel.
     ///
     /// Synchronous and idempotent, so it is safe to call from `poll_shutdown`
     /// or a `Drop` impl on a wrapper type.
@@ -415,9 +416,10 @@ mod tests {
         stream.write_all(b"hello").await.unwrap();
 
         // 验证数据发送到 channel
-        let (stream_id, data) = rx.recv().await.unwrap();
-        assert_eq!(stream_id, 1);
-        assert_eq!(data.as_ref(), b"hello");
+        assert!(matches!(
+            rx.recv().await,
+            Some((1, data)) if data.as_ref() == b"hello"
+        ));
     }
 
     #[tokio::test]
@@ -443,12 +445,16 @@ mod tests {
             "send_data should wait instead of queueing unbounded data"
         );
 
-        let (_, first) = rx.recv().await.unwrap();
-        assert_eq!(first.as_ref(), b"first");
+        assert!(matches!(
+            rx.recv().await,
+            Some((1, data)) if data.as_ref() == b"first"
+        ));
 
         second_send.await.unwrap();
-        let (_, second) = rx.recv().await.unwrap();
-        assert_eq!(second.as_ref(), b"second");
+        assert!(matches!(
+            rx.recv().await,
+            Some((1, data)) if data.as_ref() == b"second"
+        ));
     }
 
     #[tokio::test]
@@ -474,12 +480,13 @@ mod tests {
             "shutdown should wait until the FIN sentinel can be queued"
         );
 
-        let (_, first) = rx.recv().await.unwrap();
-        assert_eq!(first.as_ref(), b"first");
+        assert!(matches!(
+            rx.recv().await,
+            Some((1, data)) if data.as_ref() == b"first"
+        ));
 
         shutdown.await.unwrap();
-        let (_, fin) = rx.recv().await.unwrap();
-        assert!(fin.is_empty());
+        assert!(matches!(rx.recv().await, Some((1, data)) if data.is_empty()));
     }
 
     #[tokio::test]
@@ -520,8 +527,36 @@ mod tests {
         assert_eq!(&buf[..n], b"input");
 
         // 验证写入
-        let (stream_id, data) = rx.recv().await.unwrap();
-        assert_eq!(stream_id, 1);
-        assert_eq!(data.as_ref(), b"output");
+        assert!(matches!(
+            rx.recv().await,
+            Some((1, data)) if data.as_ref() == b"output"
+        ));
+    }
+
+    #[tokio::test]
+    async fn async_write_applies_backpressure_until_session_queue_has_room() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let (_reader_tx, reader_rx) = mpsc::channel(1);
+        let (mut stream, _synack_rx) = Stream::new(1, StreamReader::new(1, reader_rx), tx);
+
+        stream.write_all(b"first").await.unwrap();
+        let blocked = tokio::spawn(async move {
+            stream.write_all(b"second").await.unwrap();
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            !blocked.is_finished(),
+            "write should wait for queue capacity"
+        );
+
+        assert!(matches!(
+            rx.recv().await,
+            Some((1, data)) if data.as_ref() == b"first"
+        ));
+        blocked.await.unwrap();
+        assert!(matches!(
+            rx.recv().await,
+            Some((1, data)) if data.as_ref() == b"second"
+        ));
     }
 }

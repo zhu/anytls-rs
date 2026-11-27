@@ -1,8 +1,9 @@
 //! Certificate analysis and information extraction
 
 use crate::util::{AnyTlsError, Result};
+use rustls::pki_types::{CertificateDer, pem::PemObject};
 use std::fs::File;
-use std::io::{BufReader, Read};
+use std::io::Read;
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use x509_parser::prelude::*;
@@ -28,7 +29,7 @@ pub struct CertificateInfo {
     pub san_names: Vec<String>,
     /// Whether certificate is self-signed
     pub is_self_signed: bool,
-    /// Snapshot at parse time; use `days_remaining()` for live monitoring.
+    /// Days until expiration at parse time. Use `days_remaining()` for live status.
     pub days_until_expiry: i64,
 }
 
@@ -70,9 +71,8 @@ impl CertificateInfo {
 
     /// Parse certificate from PEM bytes
     pub fn from_pem_bytes(pem_data: &[u8]) -> Result<Self> {
-        // Use rustls-pemfile to parse PEM
-        let mut reader = BufReader::new(pem_data);
-        let certs = rustls_pemfile::certs(&mut reader)
+        // Use the PEM parser maintained in rustls-pki-types.
+        let certs = CertificateDer::pem_slice_iter(pem_data)
             .collect::<std::result::Result<Vec<_>, _>>()
             .map_err(|e| AnyTlsError::Tls(format!("Failed to parse PEM certificates: {}", e)))?;
 
@@ -110,6 +110,8 @@ impl CertificateInfo {
         let not_before = asn1_time_to_system_time(&cert.validity().not_before)?;
         let not_after = asn1_time_to_system_time(&cert.validity().not_after)?;
 
+        // Keep the public snapshot field accurate at parse time. Status methods
+        // below always recalculate against the current clock.
         let days_until_expiry = remaining_days(not_after, SystemTime::now());
 
         // Extract signature algorithm
@@ -151,12 +153,12 @@ impl CertificateInfo {
         })
     }
 
-    /// Get certificate status using the current clock, including validity bounds.
+    /// Get certificate status
     pub fn status(&self, warning_days: u64) -> CertStatus {
         self.status_at(SystemTime::now(), warning_days)
     }
 
-    /// Evaluate validity at a particular time without relying on the parse-time snapshot.
+    /// Evaluate validity at a specific time, including both certificate bounds.
     pub fn status_at(&self, now: SystemTime, warning_days: u64) -> CertStatus {
         if now >= self.not_after {
             CertStatus::Expired
@@ -172,19 +174,20 @@ impl CertificateInfo {
         }
     }
 
-    /// Days remaining now (negative immediately after expiration).
-    pub fn days_remaining(&self) -> i64 {
-        remaining_days(self.not_after, SystemTime::now())
-    }
-
-    /// Check the absolute validity boundary, not a rounded day count.
+    /// Check if certificate is expired
     pub fn is_expired(&self) -> bool {
         SystemTime::now() >= self.not_after
     }
 
-    /// Check if a currently valid certificate is expiring soon.
+    /// Check if certificate is expiring soon
     pub fn is_expiring_soon(&self, warning_days: u64) -> bool {
         matches!(self.status(warning_days), CertStatus::ExpiringWarning(_))
+    }
+
+    /// Number of days until expiration using the current clock. Once expired,
+    /// the result rounds away from zero so an expiry minutes ago is `-1` day.
+    pub fn days_remaining(&self) -> i64 {
+        remaining_days(self.not_after, SystemTime::now())
     }
 
     /// Format certificate info for display
@@ -230,9 +233,11 @@ impl CertificateInfo {
 
 fn remaining_days(not_after: SystemTime, now: SystemTime) -> i64 {
     match not_after.duration_since(now) {
-        Ok(duration) => (duration.as_secs() / 86400) as i64,
-        // Rounding toward zero previously hid expiration for the first 24 hours.
-        Err(error) => -(error.duration().as_secs().div_ceil(86400).max(1) as i64),
+        Ok(duration) => (duration.as_secs() / 86_400) as i64,
+        Err(error) => {
+            let elapsed = error.duration().as_secs();
+            -((elapsed / 86_400 + u64::from(elapsed % 86_400 != 0)).max(1) as i64)
+        }
     }
 }
 
@@ -254,10 +259,11 @@ fn asn1_time_to_system_time(asn1_time: &ASN1Time) -> Result<SystemTime> {
 fn format_system_time(time: SystemTime) -> String {
     match time.duration_since(UNIX_EPOCH) {
         Ok(duration) => {
-            let secs = duration.as_secs();
-            let datetime = chrono::DateTime::from_timestamp(secs as i64, 0)
-                .unwrap_or(chrono::DateTime::UNIX_EPOCH);
-            datetime.format("%Y-%m-%d %H:%M:%S UTC").to_string()
+            let timestamp = i64::try_from(duration.as_secs())
+                .ok()
+                .and_then(|secs| jiff::Timestamp::from_second(secs).ok())
+                .unwrap_or(jiff::Timestamp::UNIX_EPOCH);
+            timestamp.strftime("%Y-%m-%d %H:%M:%S %Z").to_string()
         }
         Err(_) => "Invalid time".to_string(),
     }
@@ -300,30 +306,28 @@ mod tests {
         );
     }
 
-    fn test_certificate(now: SystemTime) -> CertificateInfo {
-        CertificateInfo {
-            subject: "CN=test".into(),
-            issuer: "CN=issuer".into(),
-            serial_number: "123".into(),
-            not_before: now - Duration::from_secs(86400),
+    #[test]
+    fn test_cert_status() {
+        let now = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let info = CertificateInfo {
+            subject: "CN=test".to_string(),
+            issuer: "CN=issuer".to_string(),
+            serial_number: "123".to_string(),
+            not_before: now,
             not_after: now + Duration::from_secs(86400 * 90),
-            signature_algorithm: "SHA256".into(),
-            public_key_algorithm: "RSA".into(),
+            signature_algorithm: "SHA256".to_string(),
+            public_key_algorithm: "RSA".to_string(),
             san_names: vec![],
             is_self_signed: false,
             days_until_expiry: 90,
-        }
-    }
+        };
 
-    #[test]
-    fn status_advances_without_reloading_certificate() {
-        let now = SystemTime::now();
-        let info = test_certificate(now);
-        assert_eq!(info.status_at(now, 30), CertStatus::Valid);
-        assert_eq!(
+        // Test Valid status
+        assert!(matches!(info.status_at(now, 30), CertStatus::Valid));
+        assert!(matches!(
             info.status_at(now + Duration::from_secs(86400 * 70), 30),
             CertStatus::ExpiringWarning(20)
-        );
+        ));
         assert_eq!(info.status_at(info.not_after, 30), CertStatus::Expired);
         assert_eq!(
             info.status_at(info.not_after + Duration::from_secs(1), 30),
@@ -333,19 +337,30 @@ mod tests {
             info.status_at(info.not_before - Duration::from_secs(1), 30),
             CertStatus::Invalid(_)
         ));
-        // The public compatibility snapshot remains unchanged throughout.
-        assert_eq!(info.days_until_expiry, 90);
     }
 
     #[test]
-    fn first_second_after_expiration_is_expired() {
-        let now = SystemTime::now();
-        let mut info = test_certificate(now);
-        info.not_after = now - Duration::from_secs(1);
-        assert!(info.is_expired());
-        assert_eq!(info.days_remaining(), -1);
-        assert!(!info.is_expiring_soon(30));
-        assert!(info.display().contains("Days Until Expiry: -1"));
+    fn test_is_expired() {
+        let info_valid = CertificateInfo {
+            subject: "CN=test".to_string(),
+            issuer: "CN=issuer".to_string(),
+            serial_number: "123".to_string(),
+            not_before: SystemTime::now(),
+            not_after: SystemTime::now() + Duration::from_secs(86400 * 30),
+            signature_algorithm: "SHA256".to_string(),
+            public_key_algorithm: "RSA".to_string(),
+            san_names: vec![],
+            is_self_signed: false,
+            days_until_expiry: 30,
+        };
+        assert!(!info_valid.is_expired());
+
+        let info_expired = CertificateInfo {
+            not_after: SystemTime::now() - Duration::from_secs(1),
+            days_until_expiry: -1,
+            ..info_valid.clone()
+        };
+        assert!(info_expired.is_expired());
     }
 
     #[test]
@@ -365,6 +380,58 @@ mod tests {
 
         assert!(info.is_expiring_soon(30));
         assert!(!info.is_expiring_soon(10));
+    }
+
+    #[test]
+    fn expiry_status_uses_current_time_not_parse_snapshot() {
+        let parsed_at = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let info = CertificateInfo {
+            subject: "CN=test".into(),
+            issuer: "CN=issuer".into(),
+            serial_number: "123".into(),
+            not_before: parsed_at - Duration::from_secs(1),
+            not_after: parsed_at + Duration::from_secs(2),
+            signature_algorithm: "SHA256".into(),
+            public_key_algorithm: "RSA".into(),
+            san_names: vec![],
+            is_self_signed: false,
+            days_until_expiry: 90,
+        };
+
+        assert_eq!(
+            info.status_at(parsed_at, 30),
+            CertStatus::ExpiringWarning(0)
+        );
+        assert_eq!(
+            info.status_at(info.not_after + Duration::from_secs(1), 30),
+            CertStatus::Expired
+        );
+        assert_eq!(
+            remaining_days(info.not_after, info.not_after + Duration::from_secs(1)),
+            -1
+        );
+    }
+
+    #[test]
+    fn first_second_after_expiration_is_reported_as_expired() {
+        let now = SystemTime::now();
+        let info = CertificateInfo {
+            subject: "CN=test".into(),
+            issuer: "CN=issuer".into(),
+            serial_number: "123".into(),
+            not_before: now - Duration::from_secs(1),
+            not_after: now - Duration::from_secs(1),
+            signature_algorithm: "SHA256".into(),
+            public_key_algorithm: "RSA".into(),
+            san_names: vec![],
+            is_self_signed: false,
+            days_until_expiry: 0,
+        };
+
+        assert!(info.is_expired());
+        assert_eq!(info.days_remaining(), -1);
+        assert!(!info.is_expiring_soon(30));
+        assert!(info.display().contains("Days Until Expiry: -1"));
     }
 
     #[test]

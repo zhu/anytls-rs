@@ -9,15 +9,27 @@ use crate::util::{
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use tokio::net::TcpListener;
-use tokio::sync::{Semaphore, mpsc};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 use tokio::task::JoinSet;
 use tokio_rustls::TlsAcceptor;
 use tracing::{Instrument, field, info_span};
 
 const DEFAULT_MAX_CONNECTIONS: usize = 1024;
 const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
+const MAX_CONCURRENT_HANDSHAKES: usize = 128;
+const ACCEPT_BACKOFF_MIN: Duration = Duration::from_millis(100);
+const ACCEPT_BACKOFF_MAX: Duration = Duration::from_secs(1);
 
 type StreamCallback = Arc<dyn Fn(Arc<crate::session::Stream>) + Send + Sync + 'static>;
+
+struct ConnectionContext {
+    tls_config: Arc<TlsAcceptor>,
+    password_hash: [u8; 32],
+    padding: Arc<PaddingFactory>,
+    on_new_stream: Option<StreamCallback>,
+    server_settings: Option<StringMap>,
+    handshake_timeout: Duration,
+}
 
 /// Server manages AnyTLS server connections
 pub struct Server {
@@ -110,6 +122,8 @@ impl Server {
     pub async fn serve(&self, listener: TcpListener) -> Result<()> {
         tracing::info!("[Server] Listening on {}", listener.local_addr()?);
         let mut connections = JoinSet::new();
+        let handshake_slots = Arc::new(Semaphore::new(MAX_CONCURRENT_HANDSHAKES));
+        let mut accept_backoff = ACCEPT_BACKOFF_MIN;
         loop {
             tokio::select! {
                 result = connections.join_next(), if !connections.is_empty() => {
@@ -124,20 +138,30 @@ impl Server {
                             // A reset queued connection or temporary descriptor pressure
                             // must not terminate the listener and all healthy sessions.
                             tracing::warn!("[Server] Accept failed: {}", error);
-                            tokio::time::sleep(Duration::from_millis(100)).await;
+                            tokio::time::sleep(accept_backoff).await;
+                            accept_backoff = next_accept_backoff(accept_backoff);
                             continue;
                         }
                     };
+                    accept_backoff = ACCEPT_BACKOFF_MIN;
                     let Ok(permit) = self.connection_limit.clone().try_acquire_owned() else {
                         tracing::debug!("[Server] Connection limit reached; rejecting {}", addr);
                         continue;
                     };
-                    let tls_config = self.tls_config.read().unwrap().clone();
-                    let password_hash = self.password_hash;
-                    let padding = Arc::clone(&self.padding);
-                    let on_new_stream = self.on_new_stream.clone();
-                    let server_settings = self.server_settings.clone();
-                    let handshake_timeout = self.handshake_timeout;
+                    let Some(handshake_permit) =
+                        try_acquire_handshake_permit(&handshake_slots)
+                    else {
+                        tracing::debug!("[Server] Handshake limit reached; rejecting {}", addr);
+                        continue;
+                    };
+                    let context = ConnectionContext {
+                        tls_config: self.tls_config.read().unwrap().clone(),
+                        password_hash: self.password_hash,
+                        padding: Arc::clone(&self.padding),
+                        on_new_stream: self.on_new_stream.clone(),
+                        server_settings: self.server_settings.clone(),
+                        handshake_timeout: self.handshake_timeout,
+                    };
                     let span = info_span!(
                         "anytls.connection",
                         peer_addr = %addr,
@@ -146,10 +170,9 @@ impl Server {
                     connections.spawn(async move {
                         // The permit covers TLS, authentication, and the complete session.
                         let _permit = permit;
-                        if let Err(error) = handle_connection(
-                            stream, tls_config, password_hash, padding, on_new_stream,
-                            server_settings, handshake_timeout,
-                        ).await {
+                        if let Err(error) =
+                            handle_connection(stream, handshake_permit, context).await
+                        {
                             tracing::debug!("[Server] Connection ended: {}", error);
                         }
                     }.instrument(span));
@@ -159,16 +182,28 @@ impl Server {
     }
 }
 
+fn try_acquire_handshake_permit(slots: &Arc<Semaphore>) -> Option<OwnedSemaphorePermit> {
+    Arc::clone(slots).try_acquire_owned().ok()
+}
+
+fn next_accept_backoff(current: Duration) -> Duration {
+    (current * 2).min(ACCEPT_BACKOFF_MAX)
+}
+
 /// Handle a single TCP connection
 async fn handle_connection(
     tcp_stream: tokio::net::TcpStream,
-    tls_config: Arc<TlsAcceptor>,
-    password_hash: [u8; 32],
-    padding: Arc<PaddingFactory>,
-    on_new_stream: Option<StreamCallback>,
-    server_settings: Option<StringMap>,
-    handshake_timeout: Duration,
+    handshake_permit: OwnedSemaphorePermit,
+    context: ConnectionContext,
 ) -> Result<()> {
+    let ConnectionContext {
+        tls_config,
+        password_hash,
+        padding,
+        on_new_stream,
+        server_settings,
+        handshake_timeout,
+    } = context;
     let peer_addr = tcp_stream
         .peer_addr()
         .map(|a| a.to_string())
@@ -209,6 +244,7 @@ async fn handle_connection(
             "TLS/authentication deadline exceeded",
         ))
     })??;
+    drop(handshake_permit);
 
     // Create callback channel for new streams
     let (stream_callback_tx, stream_callback_rx) =
@@ -329,6 +365,43 @@ mod tests {
         )
     }
 
+    fn test_handshake_permit() -> OwnedSemaphorePermit {
+        try_acquire_handshake_permit(&Arc::new(Semaphore::new(1))).unwrap()
+    }
+
+    fn test_context(
+        tls_config: Arc<TlsAcceptor>,
+        handshake_timeout: Duration,
+    ) -> ConnectionContext {
+        ConnectionContext {
+            tls_config,
+            password_hash: hash_password("test-password"),
+            padding: PaddingFactory::default(),
+            on_new_stream: None,
+            server_settings: None,
+            handshake_timeout,
+        }
+    }
+
+    #[test]
+    fn handshake_admission_is_bounded_and_released() {
+        let slots = Arc::new(Semaphore::new(1));
+        let permit = try_acquire_handshake_permit(&slots).unwrap();
+        assert!(try_acquire_handshake_permit(&slots).is_none());
+
+        drop(permit);
+        assert!(try_acquire_handshake_permit(&slots).is_some());
+    }
+
+    #[test]
+    fn accept_backoff_grows_to_a_bounded_maximum() {
+        let mut backoff = ACCEPT_BACKOFF_MIN;
+        for expected_ms in [200, 400, 800, 1000, 1000] {
+            backoff = next_accept_backoff(backoff);
+            assert_eq!(backoff, Duration::from_millis(expected_ms));
+        }
+    }
+
     #[tokio::test]
     async fn incomplete_tls_handshake_has_a_deadline() {
         let server = server();
@@ -342,12 +415,8 @@ mod tests {
             TEST_DEADLINE,
             handle_connection(
                 tcp,
-                tls_config,
-                server.password_hash,
-                server.padding,
-                None,
-                None,
-                Duration::from_millis(50),
+                test_handshake_permit(),
+                test_context(tls_config, Duration::from_millis(50)),
             ),
         )
         .await
@@ -381,14 +450,14 @@ mod tests {
             .await
             .unwrap();
         let (accepted, _) = listener.accept().await.unwrap();
+        let context = test_context(
+            Arc::new(TlsAcceptor::from(Arc::new(server_config))),
+            Duration::from_millis(500),
+        );
         let handler = tokio::spawn(handle_connection(
             accepted,
-            Arc::new(TlsAcceptor::from(Arc::new(server_config))),
-            hash_password("test-password"),
-            PaddingFactory::default(),
-            None,
-            None,
-            Duration::from_millis(500),
+            test_handshake_permit(),
+            context,
         ));
         let connector = TlsConnector::from(Arc::new(client_config));
         let _tls = connector

@@ -1,4 +1,5 @@
 use crate::padding::CHECK_MARK;
+use crate::protocol::MAX_FRAME_PAYLOAD_SIZE;
 use crate::util::StringMap;
 use std::sync::Arc;
 
@@ -28,6 +29,12 @@ static DEFAULT_FACTORY: std::sync::OnceLock<Arc<PaddingFactory>> = std::sync::On
 impl PaddingFactory {
     /// Create a new PaddingFactory from raw scheme bytes
     pub fn new(raw_scheme: &[u8]) -> Result<Self, String> {
+        if raw_scheme.len() > MAX_FRAME_PAYLOAD_SIZE {
+            return Err(format!(
+                "padding scheme exceeds the {MAX_FRAME_PAYLOAD_SIZE}-byte frame payload limit"
+            ));
+        }
+
         let scheme = StringMap::from_bytes(raw_scheme);
 
         let stop = scheme
@@ -35,6 +42,8 @@ impl PaddingFactory {
             .ok_or_else(|| "missing 'stop' in padding scheme".to_string())?
             .parse::<u32>()
             .map_err(|_| "invalid 'stop' value".to_string())?;
+
+        validate_record_payload_sizes(&scheme)?;
 
         let md5_hash = md5::compute(raw_scheme);
         let md5 = format!("{:x}", md5_hash);
@@ -127,6 +136,34 @@ impl PaddingFactory {
     }
 }
 
+fn validate_record_payload_sizes(scheme: &StringMap) -> Result<(), String> {
+    for (packet, spec) in scheme.iter() {
+        if packet == "stop" || packet.parse::<u32>().is_err() {
+            continue;
+        }
+
+        for part in spec.split(',') {
+            let part = part.trim();
+            if part == "c" {
+                continue;
+            }
+
+            let Some((min, max)) = part.split_once('-') else {
+                continue;
+            };
+            let min = min.trim().parse::<i64>().unwrap_or(0);
+            let max = max.trim().parse::<i64>().unwrap_or(0);
+            if min > 0 && max > 0 && min.max(max) > MAX_FRAME_PAYLOAD_SIZE as i64 {
+                return Err(format!(
+                    "padding size exceeds the {MAX_FRAME_PAYLOAD_SIZE}-byte frame payload limit"
+                ));
+            }
+        }
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -171,5 +208,32 @@ mod tests {
         let factory2 = PaddingFactory::new(DEFAULT_PADDING_SCHEME.as_bytes()).unwrap();
 
         assert_eq!(factory1.md5(), factory2.md5());
+    }
+
+    #[test]
+    fn custom_scheme_and_padding_use_the_frame_limit_not_the_control_limit() {
+        let mut raw_scheme = b"stop=1\n0=5000-5000\nmetadata=".to_vec();
+        raw_scheme.resize(raw_scheme.len() + 4096, b'x');
+        let factory = PaddingFactory::new(&raw_scheme).unwrap();
+
+        assert_eq!(factory.raw_scheme(), raw_scheme.as_slice());
+        assert_eq!(factory.generate_record_payload_sizes(0), vec![5000]);
+    }
+
+    #[test]
+    fn custom_scheme_rejects_payloads_that_cannot_fit_in_a_frame() {
+        let oversized_raw = vec![b'x'; MAX_FRAME_PAYLOAD_SIZE + 1];
+        assert!(PaddingFactory::new(&oversized_raw).is_err());
+
+        let oversized_padding = b"stop=1\n0=65536-65536";
+        assert!(PaddingFactory::new(oversized_padding).is_err());
+
+        let maximum_padding = b"stop=1\n0=65535-65535";
+        assert_eq!(
+            PaddingFactory::new(maximum_padding)
+                .unwrap()
+                .generate_record_payload_sizes(0),
+            vec![MAX_FRAME_PAYLOAD_SIZE as i32]
+        );
     }
 }

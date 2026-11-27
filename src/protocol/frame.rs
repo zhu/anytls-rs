@@ -5,6 +5,10 @@ pub const HEADER_OVERHEAD_SIZE: usize = 7;
 
 /// The frame header encodes payload length in an unsigned 16-bit field.
 pub const MAX_FRAME_PAYLOAD_SIZE: usize = u16::MAX as usize;
+/// Bound protocol messages whose payloads are expected to remain small.
+/// Server settings are application-configurable, while padding data and
+/// padding-scheme updates use the full frame payload limit.
+pub const MAX_CONTROL_PAYLOAD_SIZE: usize = 4096;
 
 /// Command types for AnyTLS protocol frames
 #[repr(u8)]

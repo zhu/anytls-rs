@@ -1,7 +1,7 @@
 # AnyTLS-RS
 
-[![Version](https://img.shields.io/badge/version-custom--v0.5.4.2-blue.svg)](https://github.com/zhu/anytls-rs)
-[![Rust](https://img.shields.io/badge/rust-stable-orange.svg)](https://www.rust-lang.org)
+[![Version](https://img.shields.io/github/v/release/zhu/anytls-rs)](https://github.com/zhu/anytls-rs/releases)
+[![Rust](https://img.shields.io/badge/rust-1.91+-orange.svg)](https://www.rust-lang.org)
 [![Edition](https://img.shields.io/badge/edition-2024-blue.svg)](https://doc.rust-lang.org/edition-guide/)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
@@ -12,6 +12,10 @@ An asynchronous Rust implementation of AnyTLS, including a client and server. Th
 ---
 
 > **Custom server release: `custom-v0.5.4.2`** (binary version `0.5.4-custom.2`). This release fixes Rust server interoperability with dae and the AnyTLS reference client. Shadowrocket has not been tested on an iOS device. See [server compatibility notes](docs/SERVER_COMPATIBILITY.md) for limits and pinned test clients, and [Releases](https://github.com/zhu/anytls-rs/releases/tag/custom-v0.5.4.2) for downloads.
+
+## Keeping the fork in sync
+
+This fork maintains its custom build on `main` and tracks the original project through `upstream/main`. For each upstream release, branch from `main` as `sync/upstream-vX.Y.Z` and merge the upstream commit. Run the Rust tests, dependency audit, and dae and anytls-go interoperability suites, then fast-forward `main` to the verified merge commit to preserve both histories. Tag custom releases as `custom-vX.Y.Z.N`.
 
 ## ✨ Highlights
 
@@ -39,7 +43,7 @@ An asynchronous Rust implementation of AnyTLS, including a client and server. Th
 
 ### 1. Requirements
 
-- Rust stable / cargo (Rustup recommended)
+- Rust 1.91+ / Cargo (Rustup recommended)
 - Optional: `openssl` when importing external certificates
 - macOS/Linux: ensure scripts are executable (`chmod +x scripts/*.sh`)
 

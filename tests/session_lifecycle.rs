@@ -7,10 +7,10 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
-use tokio::io::{AsyncWrite, AsyncWriteExt, duplex, empty, sink};
+use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt, duplex, empty, sink};
 use tokio::sync::Notify;
 use tokio::time::timeout;
-use tokio_util::codec::Encoder;
+use tokio_util::codec::{Decoder, Encoder};
 
 const DEADLINE: Duration = Duration::from_secs(2);
 
@@ -241,18 +241,47 @@ async fn local_error_emits_fin_and_evicts_stream() {
         .close_with_error(anytls_rs::util::AnyTlsError::Protocol("test".into()))
         .await;
     assert!(synack.await.unwrap().is_err());
-    let mut wire = [0; 14];
-    timeout(
-        DEADLINE,
-        tokio::io::AsyncReadExt::read_exact(&mut peer, &mut wire),
-    )
+    let mut pending = BytesMut::new();
+    let mut codec = FrameCodec;
+    let mut frames = Vec::new();
+    timeout(DEADLINE, async {
+        loop {
+            while let Some(frame) = codec.decode(&mut pending).unwrap() {
+                let is_fin = frame.cmd == Command::Fin;
+                frames.push(frame);
+                if is_fin {
+                    return;
+                }
+            }
+
+            let mut chunk = [0; 128];
+            let count = peer.read(&mut chunk).await.unwrap();
+            assert_ne!(count, 0, "peer closed before receiving FIN");
+            pending.extend_from_slice(&chunk[..count]);
+        }
+    })
     .await
-    .unwrap()
     .unwrap();
-    assert_eq!(wire[0], Command::Syn as u8);
-    assert_eq!(wire[7], Command::Fin as u8);
+    assert_eq!(frames.last().unwrap().cmd, Command::Fin);
     assert!(!session.has_active_streams().await);
+
     session.close().await.unwrap();
+    let mut tail = Vec::new();
+    timeout(DEADLINE, peer.read_to_end(&mut tail))
+        .await
+        .unwrap()
+        .unwrap();
+    pending.extend_from_slice(&tail);
+    while let Some(frame) = codec.decode(&mut pending).unwrap() {
+        frames.push(frame);
+    }
+    assert!(pending.is_empty());
+    assert_eq!(
+        frames.iter().map(|frame| frame.cmd).collect::<Vec<_>>(),
+        [Command::Settings, Command::Syn, Command::Fin]
+    );
+    assert_eq!(frames[1].stream_id, stream.id());
+    assert_eq!(frames[2].stream_id, stream.id());
     timeout(DEADLINE, process).await.unwrap().unwrap().unwrap();
 }
 

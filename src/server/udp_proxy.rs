@@ -327,9 +327,14 @@ async fn udp_to_stream(
     is_connect: bool,
     stats: &UdpStats,
 ) -> Result<()> {
-    let mut buf = vec![0; MAX_UDP_PACKET_SIZE];
+    let mut buf = vec![0; MAX_UDP_PACKET_SIZE + 1];
     loop {
         let (length, source) = sockets.recv_from(&mut buf).await?;
+        if length > MAX_UDP_PACKET_SIZE {
+            return Err(AnyTlsError::Protocol(
+                "truncated or oversized UDP datagram".into(),
+            ));
+        }
         let packet = encode_udp_packet(&buf[..length], (!is_connect).then_some(source))?;
         stream
             .send_data(packet)

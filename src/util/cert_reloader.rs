@@ -6,7 +6,7 @@ use crate::util::{
 use notify::{Config, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 use tokio::sync::mpsc;
 use tokio_rustls::TlsAcceptor;
 use tracing::{debug, error, info, warn};
@@ -22,7 +22,8 @@ pub struct CertReloaderConfig {
     pub watch_enabled: bool,
     /// Debounce time in milliseconds
     pub debounce_ms: u64,
-    /// Check certificate expiry
+    /// Monitor expiry and warn when the active certificate is close to expiration.
+    /// A reload always requires the replacement certificate to be currently valid.
     pub check_expiry: bool,
     /// Warning threshold in days
     pub expiry_warning_days: u64,
@@ -142,23 +143,16 @@ impl CertReloader {
             }
         }
 
-        // Check expiry
-        if self.config.check_expiry {
-            match new_cert_info.status(self.config.expiry_warning_days) {
-                CertStatus::Expired => {
-                    return Err(AnyTlsError::Tls("New certificate has expired".into()));
-                }
-                CertStatus::Invalid(reason) => {
-                    return Err(AnyTlsError::Tls(format!(
-                        "New certificate is invalid: {reason}"
-                    )));
-                }
-                CertStatus::ExpiringWarning(days) => warn!(
-                    "[CertReloader] WARNING: New certificate expiring in {} days",
-                    days
-                ),
-                CertStatus::Valid => {}
-            }
+        // Validate both validity bounds before replacing the working acceptor.
+        let status = new_cert_info.status_at(SystemTime::now(), self.config.expiry_warning_days);
+        validate_renewal_status(&status)?;
+        if let CertStatus::ExpiringWarning(days) = status
+            && self.config.check_expiry
+        {
+            warn!(
+                "[CertReloader] WARNING: New certificate expiring in {} days",
+                days
+            );
         }
 
         // Update atomically
@@ -312,6 +306,16 @@ impl CertReloader {
     }
 }
 
+fn validate_renewal_status(status: &CertStatus) -> Result<()> {
+    match status {
+        CertStatus::Expired => Err(AnyTlsError::Tls("New certificate has expired".into())),
+        CertStatus::Invalid(reason) => Err(AnyTlsError::Tls(format!(
+            "New certificate is invalid: {reason}"
+        ))),
+        CertStatus::Valid | CertStatus::ExpiringWarning(_) => Ok(()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -340,6 +344,16 @@ mod tests {
         assert_eq!(config.debounce_ms, 1000);
         assert!(!config.check_expiry);
         assert_eq!(config.expiry_warning_days, 15);
+    }
+
+    #[test]
+    fn renewal_rejects_expired_and_not_yet_valid_certificates() {
+        assert!(validate_renewal_status(&CertStatus::Expired).is_err());
+        assert!(
+            validate_renewal_status(&CertStatus::Invalid("Certificate is not valid yet".into()))
+                .is_err()
+        );
+        assert!(validate_renewal_status(&CertStatus::Valid).is_ok());
     }
 
     // Integration test with actual certificate files would require:

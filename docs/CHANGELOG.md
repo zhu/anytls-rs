@@ -2,6 +2,46 @@
 
 All notable changes to this project will be documented in this file. Dates use `YYYY-MM-DD`.
 
+## [Unreleased] — custom build based on 0.5.7
+
+- Building the fork requires Rust 1.91 or newer for the locked file-watcher dependencies.
+- Settings, Alert and SynAck payloads have a 4 KiB limit. The fork accepts Waste, UpdatePaddingScheme and ServerSettings up to the 65,535-byte wire limit. Keep these payloads within 4 KiB when communicating with unmodified upstream 0.5.7 peers.
+- Certificate reloads keep the active certificate if its replacement has expired or is not yet valid, including when expiry monitoring is disabled.
+
+## [0.5.7] - 2026-11-24
+
+### Fixed
+- UoT now supports legacy v1 and v2 connected/unconnected modes, including empty datagrams, peer filtering, dual-stack addressing, and truncated packet detection.
+- TCP streams now preserve queued data across peer FIN, propagate EOF and errors to waiters, fragment large writes into valid protocol frames, and supervise forwarding tasks.
+- Session and stream handling now validates Settings and stream IDs, bounds control writes, and performs reliable cancellation and close cleanup.
+- DNS and TCP proxy paths now try multiple resolved addresses and avoid retrying successfully transmitted UDP datagrams.
+- Certificate renewals are rejected when not yet valid or expired, while certificate validity is recalculated independently of file watching.
+- Oversized or malformed control frames are rejected, and server connection/transport tasks have bounded concurrency and cleanup.
+
+## [0.5.6] - 2026-11-24
+
+### Fixed
+- DNS caching now retains multiple IP addresses per hostname, applies the requested port per connection, and rotates candidates; TCP connections can fall back to another resolved address.
+- Certificate validity summaries now use the current time and report accurate days remaining.
+- Protocol frame encoding rejects payloads larger than the wire format can represent.
+- Server handshakes now have concurrency and timeout limits, and transient accept errors use exponential backoff.
+
+### Security
+- Bounded unauthenticated handshakes to reduce resource exhaustion from slow or excessive client connections.
+- Upgraded DNS resolution to `idna` 1.x, fixing RUSTSEC-2024-0421.
+- Updated Hickory DNS and `time` to versions that include fixes for the advisories reported by `cargo audit`.
+
+### Changed
+- Replaced the unmaintained `trust-dns` resolver with maintained `hickory-resolver` and moved PEM parsing to `rustls-pki-types`.
+- Set the declared minimum Rust version to 1.88 to match the selected Hickory DNS release.
+- Removed the unused direct `serde` dependency.
+- Updated GitHub Actions to versions using the Node.js 24 runtime and documented reviewed fork updates.
+
+## [0.5.5] - 2026-11-23
+
+### Security
+- Replaced `chrono` with `jiff` in certificate validity formatting to remove the vulnerable `chrono` dependency (RUSTSEC-2026-0543).
+
 ## [custom-v0.5.4.2] - 2026-11-19
 
 ### Fixed

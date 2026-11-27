@@ -3,6 +3,7 @@
 mod common;
 
 use anyhow::Result;
+use bytes::Bytes;
 use common::*;
 use std::net::SocketAddr;
 use tokio::net::UdpSocket;
@@ -34,9 +35,6 @@ async fn test_udp_over_tcp_roundtrip() -> Result<()> {
         loop {
             match echo_socket.recv_from(&mut buf).await {
                 Ok((len, peer)) => {
-                    if len == 0 {
-                        continue;
-                    }
                     let _ = echo_socket.send_to(&buf[..len], peer).await;
                 }
                 Err(e) => {
@@ -54,27 +52,26 @@ async fn test_udp_over_tcp_roundtrip() -> Result<()> {
     // Allow proxy tasks to initialise
     sleep(Duration::from_millis(200)).await;
 
-    // Simulate local application sending UDP packets
+    // Exercise successive datagrams on the same proxy; an empty datagram must
+    // be forwarded without ending the stream's receive loop.
     let app_socket = UdpSocket::bind("127.0.0.1:0").await?;
-    let message = b"anytls-udp-test";
-    app_socket.send_to(message, proxy_addr).await?;
-
     let mut buf = vec![0u8; 1024];
-    let recv_len = timeout(Duration::from_secs(5), async {
-        loop {
-            let (len, _) = app_socket.recv_from(&mut buf).await?;
-            if len > 0 {
-                break Ok::<usize, std::io::Error>(len);
-            }
-        }
-    })
-    .await??;
+    let datagrams: [&[u8]; 3] = [b"anytls-before-empty", b"", b"anytls-after-empty"];
+    for (index, expected) in datagrams.into_iter().enumerate() {
+        app_socket.send_to(expected, proxy_addr).await?;
+        let (received_len, source) =
+            timeout(Duration::from_secs(5), app_socket.recv_from(&mut buf)).await??;
 
-    assert_eq!(
-        &buf[..recv_len],
-        message,
-        "UDP response should match request"
-    );
+        assert_eq!(
+            source, proxy_addr,
+            "datagram {index} should come from the proxy"
+        );
+        assert_eq!(
+            &buf[..received_len],
+            expected,
+            "datagram {index} should round-trip in order"
+        );
+    }
 
     // Cleanup
     drop(app_socket);
@@ -83,5 +80,128 @@ async fn test_udp_over_tcp_roundtrip() -> Result<()> {
     server_task.abort();
     echo_task.abort();
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_udp_over_tcp_non_connect_roundtrip() -> Result<()> {
+    let config = new_test_config()?;
+    let server = create_test_server(&config).await?;
+    let server_addr = config.server_addr.clone();
+    let server_task = tokio::spawn(async move {
+        let _ = server.listen(&server_addr).await;
+    });
+    sleep(Duration::from_millis(300)).await;
+
+    let echo_socket = UdpSocket::bind("127.0.0.1:0").await?;
+    let echo_addr = echo_socket.local_addr()?;
+    let echo_task = tokio::spawn(async move {
+        let mut buf = [0u8; 2048];
+        while let Ok((len, peer)) = echo_socket.recv_from(&mut buf).await {
+            let _ = echo_socket.send_to(&buf[..len], peer).await;
+        }
+    });
+
+    let client = create_test_client(&config).await?;
+    let (stream, _session) = client
+        .create_proxy_stream(("sp.v2.udp-over-tcp.arpa".to_string(), 0))
+        .await?;
+
+    // Request header: isConnect=0 followed by the standard SOCKS address format.
+    let mut wire = vec![0, 0x01];
+    wire.extend_from_slice(
+        &echo_addr
+            .ip()
+            .to_string()
+            .parse::<std::net::Ipv4Addr>()?
+            .octets(),
+    );
+    wire.extend_from_slice(&echo_addr.port().to_be_bytes());
+    // Non-connect data packet: UoT address type (IPv4=0), address, port, length, payload.
+    wire.push(0x00);
+    wire.extend_from_slice(
+        &echo_addr
+            .ip()
+            .to_string()
+            .parse::<std::net::Ipv4Addr>()?
+            .octets(),
+    );
+    wire.extend_from_slice(&echo_addr.port().to_be_bytes());
+    wire.extend_from_slice(&4u16.to_be_bytes());
+    wire.extend_from_slice(b"uot!");
+    stream.send_data(Bytes::from(wire)).await?;
+
+    let mut reader = stream.reader().lock().await;
+    let mut response = [0u8; 1 + 4 + 2 + 2 + 4];
+    timeout(Duration::from_secs(5), reader.read_exact(&mut response)).await??;
+    assert_eq!(response[0], 0x00);
+    assert_eq!(
+        &response[1..5],
+        &echo_addr
+            .ip()
+            .to_string()
+            .parse::<std::net::Ipv4Addr>()?
+            .octets()
+    );
+    assert_eq!(
+        u16::from_be_bytes([response[5], response[6]]),
+        echo_addr.port()
+    );
+    assert_eq!(u16::from_be_bytes([response[7], response[8]]), 4);
+    assert_eq!(&response[9..], b"uot!");
+
+    server_task.abort();
+    echo_task.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_udp_over_tcp_legacy_v1_roundtrip() -> Result<()> {
+    let config = new_test_config()?;
+    let server = create_test_server(&config).await?;
+    let server_addr = config.server_addr.clone();
+    let server_task = tokio::spawn(async move {
+        let _ = server.listen(&server_addr).await;
+    });
+    sleep(Duration::from_millis(300)).await;
+
+    let echo_socket = UdpSocket::bind("127.0.0.1:0").await?;
+    let echo_addr = echo_socket.local_addr()?;
+    let echo_task = tokio::spawn(async move {
+        let mut buf = [0u8; 2048];
+        while let Ok((len, peer)) = echo_socket.recv_from(&mut buf).await {
+            let _ = echo_socket.send_to(&buf[..len], peer).await;
+        }
+    });
+
+    let client = create_test_client(&config).await?;
+    let (stream, _session) = client
+        .create_proxy_stream(("sp.udp-over-tcp.arpa".to_string(), 0))
+        .await?;
+    // Legacy v1 has no initial request header: each packet begins with its
+    // destination address followed by the length and payload.
+    let mut wire = vec![0x00];
+    wire.extend_from_slice(
+        &echo_addr
+            .ip()
+            .to_string()
+            .parse::<std::net::Ipv4Addr>()?
+            .octets(),
+    );
+    wire.extend_from_slice(&echo_addr.port().to_be_bytes());
+    wire.extend_from_slice(&4u16.to_be_bytes());
+    wire.extend_from_slice(b"v1!!");
+    stream.send_data(Bytes::from(wire)).await?;
+
+    let mut reader = stream.reader().lock().await;
+    let mut response = [0u8; 1 + 4 + 2 + 2 + 4];
+    timeout(Duration::from_secs(5), reader.read_exact(&mut response)).await??;
+    assert_eq!(response[0], 0x00);
+    assert_eq!(u16::from_be_bytes([response[7], response[8]]), 4);
+    assert_eq!(&response[9..], b"v1!!");
+
+    server_task.abort();
+    echo_task.abort();
+    drop(client);
     Ok(())
 }

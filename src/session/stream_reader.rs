@@ -235,4 +235,27 @@ mod tests {
 
         assert_eq!(total, b"chunk1chunk2chunk3");
     }
+
+    #[tokio::test]
+    async fn bounded_reader_queue_applies_backpressure() {
+        let (tx, rx) = mpsc::channel(1);
+        let mut reader = StreamReader::new(1, rx);
+        tx.send(Bytes::from_static(b"first")).await.unwrap();
+
+        let blocked_send = tokio::spawn(async move {
+            tx.send(Bytes::from_static(b"second")).await.unwrap();
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            !blocked_send.is_finished(),
+            "send should wait for reader capacity"
+        );
+
+        let mut buf = [0u8; 8];
+        let n = reader.read(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"first");
+        blocked_send.await.unwrap();
+        let n = reader.read(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"second");
+    }
 }

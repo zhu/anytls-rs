@@ -5,12 +5,16 @@
 //! These benchmarks measure performance under concurrent load
 
 use anytls_rs::padding::PaddingFactory;
+use anytls_rs::protocol::{Command, FrameCodec};
 use anytls_rs::session::Session;
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use std::hint::black_box;
 use std::sync::Arc;
-use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
+use tokio::task::JoinSet;
+use tokio::time::{Duration, timeout};
+use tokio_util::codec::Decoder;
 
 /// Mock async reader/writer for testing
 struct MockStream;
@@ -120,6 +124,22 @@ fn bench_concurrent_stream_creation(c: &mut Criterion) {
     group.finish();
 }
 
+async fn receive_push_frames(mut peer: tokio::io::DuplexStream, count: usize, data_size: usize) {
+    let mut input = BytesMut::new();
+    let mut codec = FrameCodec;
+    let mut received = 0;
+    while received < count {
+        assert_ne!(peer.read_buf(&mut input).await.unwrap(), 0, "early EOF");
+        while let Some(frame) = codec.decode(&mut input).unwrap() {
+            if frame.cmd == Command::Push {
+                assert_eq!(frame.data.len(), data_size);
+                received += 1;
+            }
+        }
+    }
+    assert_eq!(received, count);
+}
+
 fn bench_concurrent_stream_data_send(c: &mut Criterion) {
     let mut group = c.benchmark_group("concurrent_stream_data_send");
 
@@ -133,37 +153,39 @@ fn bench_concurrent_stream_data_send(c: &mut Criterion) {
             |b, &(&stream_count, &data_size)| {
                 b.to_async(tokio::runtime::Runtime::new().unwrap())
                     .iter(|| async {
-                        let session = Arc::new(create_test_session().await);
+                        let (writer, peer) = tokio::io::duplex(64 * 1024);
+                        let session = Arc::new(Session::new_client(
+                            tokio::io::empty(),
+                            writer,
+                            PaddingFactory::default(),
+                            None,
+                        ));
+                        let writer_session = session.clone();
+                        let writer_task =
+                            tokio::spawn(async move { writer_session.process_stream_data().await });
+
                         let mut streams = Vec::new();
-
-                        // Create streams
                         for _ in 0..stream_count {
-                            if let Ok((stream, _)) = session.open_stream().await {
-                                streams.push(stream);
-                            }
+                            let (stream, _) = session.open_stream().await.unwrap();
+                            streams.push(stream);
                         }
 
-                        // Send data concurrently
-                        let handles: Vec<_> = streams
-                            .into_iter()
-                            .map(|stream| {
-                                tokio::spawn(async move {
-                                    let data = Bytes::from(vec![0u8; data_size]);
-                                    for _ in 0..10 {
-                                        let _ = stream.send_data(data.clone()).await;
-                                    }
-                                    stream
-                                })
-                            })
-                            .collect();
-
-                        let mut results = Vec::new();
-                        for handle in handles {
-                            if let Ok(result) = handle.await {
-                                results.push(result);
-                            }
+                        let mut tasks = JoinSet::new();
+                        tasks.spawn(receive_push_frames(peer, stream_count * 10, data_size));
+                        for stream in streams {
+                            tasks.spawn(async move {
+                                let payload = Bytes::from(vec![0; data_size]);
+                                for _ in 0..10 {
+                                    stream.send_data(payload.clone()).await.unwrap();
+                                }
+                            });
                         }
-                        black_box(results);
+
+                        timeout(Duration::from_secs(5), tasks.join_all())
+                            .await
+                            .expect("timed out waiting for concurrent stream delivery");
+                        session.close().await.unwrap();
+                        writer_task.await.unwrap().unwrap();
                     })
             },
         );

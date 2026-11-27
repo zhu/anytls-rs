@@ -1,6 +1,7 @@
 use anytls_rs::padding::PaddingFactory;
 use anytls_rs::protocol::{Command, Frame, FrameCodec, MAX_FRAME_PAYLOAD_SIZE};
 use anytls_rs::session::{Session, Stream};
+use anytls_rs::util::StringMap;
 use bytes::{Bytes, BytesMut};
 use std::sync::Arc;
 use std::time::Duration;
@@ -19,10 +20,19 @@ async fn feed_server_with_padding(
     frames: Vec<Frame>,
     padding: Arc<PaddingFactory>,
 ) -> (bool, Vec<Arc<Stream>>, Vec<Frame>) {
+    feed_server_with_server_settings(frames, padding, None).await
+}
+
+async fn feed_server_with_server_settings(
+    frames: Vec<Frame>,
+    padding: Arc<PaddingFactory>,
+    server_settings: Option<StringMap>,
+) -> (bool, Vec<Arc<Stream>>, Vec<Frame>) {
     let (transport, peer) = duplex(65536);
     let (reader, writer) = tokio::io::split(transport);
     let (mut peer_reader, mut peer_writer) = tokio::io::split(peer);
     let mut server = Session::new_server(reader, writer, padding);
+    server.set_server_settings(server_settings);
     let (streams_tx, mut streams_rx) = mpsc::unbounded_channel();
     server.set_stream_callback(streams_tx);
     let server = Arc::new(server);
@@ -96,6 +106,55 @@ async fn padding_negotiation_returns_exact_server_scheme_only_on_md5_mismatch() 
                 .any(|frame| frame.cmd == Command::ServerSettings)
         );
     }
+}
+
+#[tokio::test]
+async fn padding_scheme_update_can_use_the_full_frame_payload_limit() {
+    let raw_scheme = format!("stop=0\nmetadata={}", "x".repeat(5000));
+    let padding = Arc::new(PaddingFactory::new(raw_scheme.as_bytes()).unwrap());
+    let (accepted, streams, replies) = feed_server_with_padding(
+        vec![Frame::with_data(
+            Command::Settings,
+            0,
+            Bytes::from_static(b"v=2\npadding-md5=00000000000000000000000000000000"),
+        )],
+        padding,
+    )
+    .await;
+
+    assert!(accepted);
+    assert!(streams.is_empty());
+    let update = replies
+        .iter()
+        .find(|frame| frame.cmd == Command::UpdatePaddingScheme)
+        .expect("padding mismatch should return the configured scheme");
+    assert_eq!(update.data.as_ref(), raw_scheme.as_bytes());
+    assert!(update.data.len() > 4096);
+}
+
+#[tokio::test]
+async fn configured_server_settings_over_4k_are_received() {
+    let value = "x".repeat(5000);
+    let mut server_settings = StringMap::new();
+    server_settings.insert("custom", value.clone());
+    let (accepted, streams, replies) = feed_server_with_server_settings(
+        vec![settings(2)],
+        PaddingFactory::default(),
+        Some(server_settings),
+    )
+    .await;
+
+    assert!(accepted);
+    assert!(streams.is_empty());
+    let frame = replies
+        .iter()
+        .find(|frame| frame.cmd == Command::ServerSettings)
+        .expect("server should return configured settings");
+    assert!(frame.data.len() > 4096);
+    assert_eq!(
+        StringMap::from_bytes(&frame.data).get("custom"),
+        Some(&value)
+    );
 }
 
 #[tokio::test]
@@ -198,6 +257,36 @@ async fn large_application_write_is_split_into_valid_frames() {
     assert!(wire.is_empty());
     assert_eq!(sizes, [MAX_FRAME_PAYLOAD_SIZE, MAX_FRAME_PAYLOAD_SIZE, 1]);
     assert_eq!(reconstructed, data);
+}
+
+#[tokio::test]
+async fn custom_padding_waste_uses_the_full_u16_wire_limit() {
+    let (writer, mut peer) = duplex(70_000);
+    let padding = Arc::new(PaddingFactory::new(b"stop=1\n0=65535-65535").unwrap());
+    let session = Session::new_client(empty(), writer, padding, None);
+
+    session
+        .write_control_frame(Frame::control(Command::HeartRequest, 0))
+        .await
+        .unwrap();
+    session.close().await.unwrap();
+
+    let mut wire = Vec::new();
+    timeout(DEADLINE, peer.read_to_end(&mut wire))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(wire.len(), MAX_FRAME_PAYLOAD_SIZE);
+    let mut wire = BytesMut::from(wire.as_slice());
+    let mut codec = FrameCodec;
+    let frames = std::iter::from_fn(|| codec.decode(&mut wire).unwrap()).collect::<Vec<_>>();
+
+    assert!(wire.is_empty());
+    assert_eq!(
+        frames.iter().map(|frame| frame.cmd).collect::<Vec<_>>(),
+        [Command::HeartRequest, Command::Waste]
+    );
+    assert_eq!(frames[1].data.len(), 65_521);
 }
 
 #[test]

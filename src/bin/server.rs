@@ -275,7 +275,8 @@ async fn main() -> Result<()> {
                 info!("[Server] Certificate file watching enabled");
             }
         }
-        // Monitoring also applies to certificates reloaded manually with SIGHUP.
+        // Expiry checks also cover manually reloaded certificates, even when
+        // filesystem watching is disabled.
         reloader
             .clone()
             .start_expiry_checker(Duration::from_secs(3600));

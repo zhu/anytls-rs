@@ -1,7 +1,6 @@
 //! A failed rotation must leave the existing certificate usable by TLS clients.
 
 use anytls_rs::util::{CertReloader, CertReloaderConfig};
-use chrono::{Datelike, Utc};
 use rcgen::{CertificateParams, KeyPair, date_time_ymd};
 use rustls::pki_types::{CertificateDer, ServerName};
 use std::sync::Arc;
@@ -57,7 +56,11 @@ async fn rejected_reload_keeps_active_certificate(
         watch_enabled: false,
         ..Default::default()
     };
-    let year = Utc::now().year();
+    let year = i32::from(
+        jiff::Timestamp::now()
+            .to_zoned_datetime(jiff::tz::TimeZone::UTC)
+            .year(),
+    );
     let original = write_certificate(&config, year - 1, year + 5);
     let reloader = CertReloader::new(config.clone()).unwrap();
     let original_acceptor = reloader.get_acceptor();
@@ -86,12 +89,20 @@ async fn rejected_reload_keeps_active_certificate(
 
 #[tokio::test]
 async fn future_dated_reload_preserves_the_current_certificate() {
-    let year = Utc::now().year();
+    let year = i32::from(
+        jiff::Timestamp::now()
+            .to_zoned_datetime(jiff::tz::TimeZone::UTC)
+            .year(),
+    );
     rejected_reload_keeps_active_certificate(year + 1, year + 2, "not valid yet").await;
 }
 
 #[tokio::test]
 async fn expired_reload_preserves_the_current_certificate() {
-    let year = Utc::now().year();
+    let year = i32::from(
+        jiff::Timestamp::now()
+            .to_zoned_datetime(jiff::tz::TimeZone::UTC)
+            .year(),
+    );
     rejected_reload_keeps_active_certificate(year - 2, year - 1, "has expired").await;
 }

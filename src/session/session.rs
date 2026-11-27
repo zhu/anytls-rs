@@ -55,6 +55,7 @@ pub struct Session {
     // Session state
     is_closed: Arc<std::sync::atomic::AtomicBool>,
     received_settings: std::sync::atomic::AtomicBool,
+    settings_lock: tokio::sync::Mutex<()>,
     last_peer_stream_id: std::sync::atomic::AtomicU32,
 
     // Padding factory (wrapped in Arc for potential updates)
@@ -158,6 +159,7 @@ impl Session {
             stream_receive_tx: Arc::new(RwLock::new(HashMap::new())),
             is_closed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             received_settings: std::sync::atomic::AtomicBool::new(false),
+            settings_lock: tokio::sync::Mutex::new(()),
             last_peer_stream_id: std::sync::atomic::AtomicU32::new(0),
             padding: Arc::new(RwLock::new(padding)),
             is_client: true,
@@ -195,6 +197,7 @@ impl Session {
             stream_receive_tx: Arc::new(RwLock::new(HashMap::new())),
             is_closed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             received_settings: std::sync::atomic::AtomicBool::new(false),
+            settings_lock: tokio::sync::Mutex::new(()),
             last_peer_stream_id: std::sync::atomic::AtomicU32::new(0),
             padding: Arc::new(RwLock::new(padding)),
             is_client: false,
@@ -742,7 +745,7 @@ impl Session {
                                 0,
                                 Bytes::copy_from_slice(raw_scheme),
                             );
-                            self.write_frame(update_frame).await?;
+                            self.write_control_frame(update_frame).await?;
                         }
                     }
 
@@ -767,7 +770,7 @@ impl Session {
                             0,
                             Bytes::from(server_settings.to_bytes()),
                         );
-                        self.write_frame(server_settings_frame).await?;
+                        self.write_control_frame(server_settings_frame).await?;
                     }
                 }
             }
@@ -871,10 +874,12 @@ impl Session {
             tracing::warn!("[Session] Attempted to open stream on closed session");
             return Err(AnyTlsError::SessionClosed);
         }
+        if self.is_client {
+            self.ensure_client_settings().await?;
+        }
 
-        let stream_id = self
-            .stream_id
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let stream_id = next_stream_id(&self.stream_id)
+            .ok_or_else(|| AnyTlsError::Protocol("stream ID space exhausted".into()))?;
         tracing::debug!(
             "[Session] Opening new stream {} (client={})",
             stream_id,
@@ -899,7 +904,7 @@ impl Session {
         // Send SYN frame
         tracing::trace!("[Session] Sending SYN frame for stream {}", stream_id);
         let frame = Frame::control(Command::Syn, stream_id);
-        self.write_frame(frame).await?;
+        self.write_control_frame(frame).await?;
         tracing::debug!("[Session] SYN frame sent for stream {}", stream_id);
 
         Ok((stream, synack_rx))
@@ -932,6 +937,39 @@ impl Session {
         let mut receive_map = self.stream_receive_tx.write().await;
         streams.insert(stream_id, stream);
         receive_map.insert(stream_id, receive_tx);
+        Ok(())
+    }
+
+    async fn ensure_client_settings(&self) -> Result<()> {
+        if self
+            .received_settings
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Ok(());
+        }
+
+        let _settings_guard = self.settings_lock.lock().await;
+        if self
+            .received_settings
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Ok(());
+        }
+
+        let mut settings = StringMap::new();
+        settings.insert("v", "2");
+        settings.insert("client", "anytls-rs/0.1.0");
+        let padding_md5 = self.padding.read().await.md5().to_string();
+        settings.insert("padding-md5", padding_md5);
+
+        self.write_control_frame(Frame::with_data(
+            Command::Settings,
+            0,
+            Bytes::from(settings.to_bytes()),
+        ))
+        .await?;
+        self.received_settings
+            .store(true, std::sync::atomic::Ordering::Release);
         Ok(())
     }
 
@@ -1147,6 +1185,12 @@ impl Session {
                 continue;
             }
 
+            if size < 0 || size as usize > MAX_FRAME_PAYLOAD_SIZE {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("padding payload exceeds {MAX_FRAME_PAYLOAD_SIZE} bytes"),
+                ));
+            }
             let size = size as usize;
 
             tracing::trace!(
@@ -1175,6 +1219,13 @@ impl Session {
             } else if remain_payload_len > 0 {
                 // This packet contains payload + padding
                 let padding_len = size.saturating_sub(remain_payload_len + HEADER_OVERHEAD_SIZE);
+
+                if padding_len > MAX_FRAME_PAYLOAD_SIZE {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!("padding payload exceeds {MAX_FRAME_PAYLOAD_SIZE} bytes"),
+                    ));
+                }
 
                 if padding_len > 0 {
                     // Create padding frame (cmdWaste)
@@ -1221,75 +1272,42 @@ impl Session {
 
     /// Start the client session (send settings and start recv loop)
     pub async fn start_client(self: Arc<Self>) -> Result<()> {
-        use crate::util::StringMap;
+        if !self
+            .received_settings
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            self.buffering
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        self.ensure_client_settings().await?;
 
-        // Send settings frame
-        let mut settings = StringMap::new();
-        settings.insert("v", "2");
-        settings.insert("client", "anytls-rs/0.1.0");
-        let padding_md5 = {
-            let padding_guard = self.padding.read().await;
-            padding_guard.md5().to_string()
-        };
-        settings.insert("padding-md5", padding_md5);
-
-        let frame = Frame::with_data(Command::Settings, 0, Bytes::from(settings.to_bytes()));
-
-        self.buffering
-            .store(true, std::sync::atomic::Ordering::Relaxed);
-        self.write_frame(frame).await?;
-
-        // Start receive loop in background
-        let session = Arc::clone(&self);
+        // The receive and writer loops share a transport. Once either exits,
+        // close the session and stop its sibling before the socket can linger.
+        let mut transport_tasks = tokio::task::JoinSet::new();
+        let recv_session = Arc::clone(&self);
+        transport_tasks.spawn(async move { recv_session.recv_loop().await });
+        let process_session = Arc::clone(&self);
+        transport_tasks.spawn(async move { process_session.process_stream_data().await });
+        let supervisor_session = Arc::clone(&self);
         tokio::spawn(async move {
-            tracing::debug!(
-                "[Session] recv_loop task spawned (client={})",
-                session.is_client
-            );
-            match session.recv_loop().await {
-                Ok(()) => {
-                    tracing::debug!("[Session] recv_loop task completed normally");
-                }
-                Err(AnyTlsError::Io(e)) => {
-                    // Check if this is a close_notify error (normal connection close)
-                    let error_msg = e.to_string();
-                    if error_msg.contains("close_notify")
-                        || error_msg.contains("unexpected EOF")
-                        || e.kind() == std::io::ErrorKind::UnexpectedEof
-                    {
-                        tracing::debug!(
-                            "[Session] recv_loop task ended: Connection closed by peer (no close_notify) - this is normal"
-                        );
-                    } else {
-                        tracing::error!("[Session] recv_loop task error: {}", e);
-                    }
-                }
-                Err(AnyTlsError::SessionClosed) => {
-                    tracing::debug!("[Session] recv_loop task ended: Session closed");
-                }
-                Err(e) => {
-                    tracing::error!("[Session] recv_loop task error: {}", e);
+            if let Some(result) = transport_tasks.join_next().await {
+                match result {
+                    Err(error) => tracing::error!(
+                        session_id = supervisor_session.id(),
+                        "[Session] Client transport task panicked: {}",
+                        error
+                    ),
+                    Ok(Err(error)) => tracing::debug!(
+                        session_id = supervisor_session.id(),
+                        "[Session] Client transport ended: {}",
+                        error
+                    ),
+                    Ok(Ok(())) => {}
                 }
             }
-            // The read side is gone: mark the session closed so the pool stops
-            // handing it out, its writer half is shut down, and the heartbeat
-            // task exits — otherwise a server-closed session lingered in the
-            // pool (heartbeat keeping its socket open) and leaked its fd.
-            let _ = session.close().await;
-        });
-
-        // Start stream data processing in background
-        let session = Arc::clone(&self);
-        tokio::spawn(async move {
-            tracing::debug!(
-                "[Session] process_stream_data task spawned (client={})",
-                session.is_client
-            );
-            if let Err(e) = session.process_stream_data().await {
-                tracing::error!("[Session] process_stream_data task error: {}", e);
-            } else {
-                tracing::debug!("[Session] process_stream_data task completed normally");
-            }
+            let _ = supervisor_session.close().await;
+            transport_tasks.abort_all();
+            while transport_tasks.join_next().await.is_some() {}
         });
 
         if let Some(heartbeat_state) = self.heartbeat.as_ref().map(Arc::clone) {
@@ -1418,6 +1436,23 @@ impl Session {
             };
 
             match result {
+                Some((stream_id, data)) if data.is_empty() => {
+                    tracing::debug!(
+                        session_id = session_id,
+                        "[Session] process_stream_data: closing stream {} (FIN)",
+                        stream_id
+                    );
+                    let stream = self.streams.write().await.remove(&stream_id);
+                    if let Some(stream) = &stream {
+                        stream
+                            .close_locally(AnyTlsError::Io(std::io::ErrorKind::BrokenPipe.into()));
+                    }
+                    self.stream_receive_tx.write().await.remove(&stream_id);
+                    if stream.is_some() {
+                        self.write_control_frame(Frame::control(Command::Fin, stream_id))
+                            .await?;
+                    }
+                }
                 Some((stream_id, data)) => {
                     if self.is_closed() {
                         tracing::debug!(
@@ -1426,30 +1461,6 @@ impl Session {
                             iteration
                         );
                         break;
-                    }
-                    if data.is_empty() {
-                        // Stream-close sentinel (see `Stream::close`): emit a
-                        // FIN for this stream so the peer evicts its slot, then
-                        // drop our own stream maps. This keeps `streams` /
-                        // `stream_receive_tx` bounded over a long-lived session
-                        // instead of growing one entry per opened stream.
-                        tracing::debug!(
-                            session_id = session_id,
-                            "[Session] process_stream_data: closing stream {} (FIN)",
-                            stream_id
-                        );
-                        let stream = self.streams.write().await.remove(&stream_id);
-                        if let Some(stream) = &stream {
-                            stream.close_locally(AnyTlsError::Io(
-                                std::io::ErrorKind::BrokenPipe.into(),
-                            ));
-                        }
-                        self.stream_receive_tx.write().await.remove(&stream_id);
-                        if stream.is_some() {
-                            self.write_control_frame(Frame::control(Command::Fin, stream_id))
-                                .await?;
-                        }
-                        continue;
                     }
                     // The peer may have closed while data was queued. A FIN
                     // closes both directions and must not be answered with data.
@@ -1531,6 +1542,26 @@ impl Session {
     }
 }
 
+fn next_stream_id(counter: &std::sync::atomic::AtomicU32) -> Option<u32> {
+    loop {
+        let current = counter.load(std::sync::atomic::Ordering::Relaxed);
+        if current == 0 || current == u32::MAX {
+            return None;
+        }
+        if counter
+            .compare_exchange(
+                current,
+                current + 1,
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+            )
+            .is_ok()
+        {
+            return Some(current);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1546,6 +1577,15 @@ mod tests {
     fn create_test_padding() -> Arc<PaddingFactory> {
         use crate::padding::DEFAULT_PADDING_SCHEME;
         Arc::new(PaddingFactory::new(DEFAULT_PADDING_SCHEME.as_bytes()).unwrap())
+    }
+
+    #[test]
+    fn local_stream_ids_do_not_wrap_to_zero() {
+        let counter = std::sync::atomic::AtomicU32::new(u32::MAX - 1);
+
+        assert_eq!(next_stream_id(&counter), Some(u32::MAX - 1));
+        assert_eq!(next_stream_id(&counter), None);
+        assert_eq!(counter.load(std::sync::atomic::Ordering::Relaxed), u32::MAX);
     }
 
     #[tokio::test]

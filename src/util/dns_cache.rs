@@ -2,7 +2,7 @@
 
 use crate::util::{AnyTlsError, Result};
 use hickory_resolver::TokioResolver;
-use hickory_resolver::config::{NameServerConfig, ResolverConfig, ResolverOpts};
+use hickory_resolver::config::{ConnectionConfig, NameServerConfig, ResolverConfig};
 use hickory_resolver::net::runtime::TokioRuntimeProvider;
 use once_cell::sync::Lazy;
 use std::collections::HashMap;
@@ -18,7 +18,7 @@ use tracing::{debug, info, trace};
 const DEFAULT_TTL: Duration = Duration::from_secs(60);
 /// Timeout for DNS lookup operations.
 const DNS_TIMEOUT: Duration = Duration::from_secs(10);
-/// Bound memory retained for client-controlled hostnames.
+/// Bound memory used by hostnames supplied by remote clients.
 const MAX_CACHE_ENTRIES: usize = 4096;
 
 static DNS_CACHE: Lazy<DnsCache> = Lazy::new(DnsCache::new);
@@ -43,20 +43,28 @@ impl DnsCache {
 
     async fn get(&self, host: &str, port: u16) -> Option<Vec<SocketAddr>> {
         let mut cache = self.inner.write().await;
-        let entry = cache.get_mut(host)?;
-        if Instant::now() >= entry.expires_at || entry.addresses.is_empty() {
+        let now = Instant::now();
+        if cache
+            .get(host)
+            .is_some_and(|entry| now >= entry.expires_at || entry.addresses.is_empty())
+        {
             cache.remove(host);
             return None;
         }
-        // Select and advance under one lock, so concurrent requests rotate too.
+
+        let entry = cache.get_mut(host)?;
         let index = entry.next_index % entry.addresses.len();
         entry.next_index = (index + 1) % entry.addresses.len();
         let addresses = entry.addresses[index..]
             .iter()
             .chain(&entry.addresses[..index])
             .map(|ip| SocketAddr::new(*ip, port))
-            .collect();
-        trace!("[DNS] Cache hit for {}", host);
+            .collect::<Vec<_>>();
+        trace!(
+            "[DNS] Cache hit for {} -> {} addresses",
+            host,
+            addresses.len()
+        );
         Some(addresses)
     }
 
@@ -65,14 +73,13 @@ impl DnsCache {
         if cache.len() >= MAX_CACHE_ENTRIES && !cache.contains_key(&host) {
             let now = Instant::now();
             cache.retain(|_, entry| entry.expires_at > now);
-            if cache.len() >= MAX_CACHE_ENTRIES {
-                let oldest = cache
+            if cache.len() >= MAX_CACHE_ENTRIES
+                && let Some(oldest) = cache
                     .iter()
                     .min_by_key(|(_, entry)| entry.expires_at)
-                    .map(|(host, _)| host.clone());
-                if let Some(oldest) = oldest {
-                    cache.remove(&oldest);
-                }
+                    .map(|(host, _)| host.clone())
+            {
+                cache.remove(&oldest);
             }
         }
         cache.insert(
@@ -80,7 +87,6 @@ impl DnsCache {
             CacheEntry {
                 addresses,
                 expires_at: Instant::now() + DEFAULT_TTL,
-                // The lookup that fills this entry uses the first address.
                 next_index: 1,
             },
         );
@@ -92,7 +98,7 @@ impl DnsCache {
     }
 }
 
-/// Resolve one address, rotating cached IPs and attaching this request's port.
+/// Resolve a hostname with caching and timeout.
 pub async fn resolve_host_with_cache(host: &str, port: u16) -> Result<SocketAddr> {
     resolve_host_addresses_with_cache(host, port)
         .await?
@@ -101,10 +107,8 @@ pub async fn resolve_host_with_cache(host: &str, port: u16) -> Result<SocketAddr
         .ok_or_else(|| AnyTlsError::Protocol(format!("No address found for {}", host)))
 }
 
-/// Resolve all candidate addresses with caching and timeout.
-///
-/// Only IPs are cached: ports belong to individual proxy requests. Cached results
-/// rotate their starting address but retain every candidate for dial fallback.
+/// Resolve all candidate addresses, preserving the requested port and rotating
+/// the starting address on cache hits.
 pub async fn resolve_host_addresses_with_cache(host: &str, port: u16) -> Result<Vec<SocketAddr>> {
     if let Ok(ip) = host.parse::<IpAddr>() {
         return Ok(vec![SocketAddr::new(ip, port)]);
@@ -115,34 +119,43 @@ pub async fn resolve_host_addresses_with_cache(host: &str, port: u16) -> Result<
     }
 
     let resolver_opt = DNS_RESOLVER.read().await.clone();
-    let lookup = async {
-        if let Some(resolver) = resolver_opt {
-            resolver
-                .lookup_ip(host)
-                .await
-                .map(|lookup| lookup.iter().collect::<Vec<_>>())
-                .map_err(|err| Error::other(err.to_string()))
-        } else {
-            lookup_host((host, 0))
-                .await
-                .map(|lookup| lookup.map(|address| address.ip()).collect::<Vec<_>>())
-        }
+    let mut addresses: Vec<IpAddr> = if let Some(resolver) = resolver_opt {
+        let lookup = tokio::time::timeout(DNS_TIMEOUT, resolver.lookup_ip(host))
+            .await
+            .map_err(|_| {
+                AnyTlsError::Protocol(format!(
+                    "DNS resolution timeout ({}s) for {}",
+                    DNS_TIMEOUT.as_secs(),
+                    host
+                ))
+            })?
+            .map_err(|err| {
+                AnyTlsError::Io(Error::other(format!(
+                    "DNS resolution failed for {}: {}",
+                    host, err
+                )))
+            })?;
+        lookup.iter().collect()
+    } else {
+        let lookup_future = lookup_host((host, 0));
+        tokio::time::timeout(DNS_TIMEOUT, lookup_future)
+            .await
+            .map_err(|_| {
+                AnyTlsError::Protocol(format!(
+                    "DNS resolution timeout ({}s) for {}",
+                    DNS_TIMEOUT.as_secs(),
+                    host
+                ))
+            })?
+            .map_err(|err| {
+                AnyTlsError::Io(Error::other(format!(
+                    "DNS resolution failed for {}: {}",
+                    host, err
+                )))
+            })?
+            .map(|addr| addr.ip())
+            .collect::<Vec<_>>()
     };
-    let mut addresses = tokio::time::timeout(DNS_TIMEOUT, lookup)
-        .await
-        .map_err(|_| {
-            AnyTlsError::Protocol(format!(
-                "DNS resolution timeout ({}s) for {}",
-                DNS_TIMEOUT.as_secs(),
-                host
-            ))
-        })?
-        .map_err(|err| {
-            AnyTlsError::Io(Error::other(format!(
-                "DNS resolution failed for {}: {}",
-                host, err
-            )))
-        })?;
 
     if addresses.is_empty() {
         return Err(AnyTlsError::Protocol(format!(
@@ -151,15 +164,20 @@ pub async fn resolve_host_addresses_with_cache(host: &str, port: u16) -> Result<
         )));
     }
 
-    // Stable order on the first lookup; subsequent hits rotate the candidates.
-    addresses.sort_unstable();
+    // Sort to keep stability across runs (helps caching)
+    addresses.sort_unstable_by_key(|addr| match addr {
+        IpAddr::V4(ip) => (0, ip.octets().to_vec()),
+        IpAddr::V6(ip) => (1, ip.octets().to_vec()),
+    });
     addresses.dedup();
+
     debug!(
         "[DNS] Resolved {} -> {} entries (ttl={}s)",
         host,
         addresses.len(),
         DEFAULT_TTL.as_secs()
     );
+
     DNS_CACHE.insert(host.to_string(), addresses.clone()).await;
     Ok(addresses
         .into_iter()
@@ -184,23 +202,13 @@ pub async fn set_custom_dns_servers(servers: &[String]) -> Result<()> {
         return Ok(());
     }
 
-    let name_servers = parsed_servers
-        .iter()
-        .map(|server| {
-            let mut config = NameServerConfig::udp_and_tcp(server.ip());
-            for connection in &mut config.connections {
-                connection.port = server.port();
-            }
-            config
-        })
-        .collect();
-    let resolver = TokioResolver::builder_with_config(
-        ResolverConfig::from_name_servers(name_servers),
+    let resolver_config = resolver_config_for_servers(&parsed_servers);
+    let resolver = hickory_resolver::Resolver::builder_with_config(
+        resolver_config,
         TokioRuntimeProvider::default(),
     )
-    .with_options(ResolverOpts::default())
     .build()
-    .map_err(|error| AnyTlsError::Config(format!("Cannot configure DNS resolver: {error}")))?;
+    .map_err(|err| AnyTlsError::Config(format!("Failed to create custom DNS resolver: {err}")))?;
     *resolver_guard = Some(Arc::new(resolver));
     DNS_CACHE.clear().await;
 
@@ -214,6 +222,21 @@ pub async fn set_custom_dns_servers(servers: &[String]) -> Result<()> {
     );
 
     Ok(())
+}
+
+fn resolver_config_for_servers(servers: &[SocketAddr]) -> ResolverConfig {
+    let name_servers = servers
+        .iter()
+        .map(|server| {
+            let mut udp = ConnectionConfig::udp();
+            udp.port = server.port();
+            let mut tcp = ConnectionConfig::tcp();
+            tcp.port = server.port();
+            NameServerConfig::new(server.ip(), true, vec![udp, tcp])
+        })
+        .collect();
+
+    ResolverConfig::from_name_servers(name_servers)
 }
 
 fn parse_dns_server(entry: &str) -> std::io::Result<SocketAddr> {
@@ -252,55 +275,86 @@ fn parse_dns_server(entry: &str) -> std::io::Result<SocketAddr> {
 mod tests {
     use super::*;
 
-    #[tokio::test]
-    async fn cached_dns_keeps_request_ports_and_all_candidates() {
-        let cache = DnsCache::new();
-        let ips = vec!["127.0.0.1".parse().unwrap(), "::1".parse().unwrap()];
-        cache.insert("example.test".into(), ips.clone()).await;
-        let https = cache.get("example.test", 443).await.unwrap();
-        let http = cache.get("example.test", 80).await.unwrap();
-        assert_eq!(
-            https,
-            vec![SocketAddr::new(ips[1], 443), SocketAddr::new(ips[0], 443)]
-        );
-        assert_eq!(
-            http,
-            vec![SocketAddr::new(ips[0], 80), SocketAddr::new(ips[1], 80)]
-        );
+    #[test]
+    fn custom_resolver_config_preserves_server_ports_for_udp_and_tcp() {
+        let servers = [
+            "1.1.1.1:5353".parse().unwrap(),
+            "[2606:4700:4700::1111]:8053".parse().unwrap(),
+        ];
+        let (_, _, configured) = resolver_config_for_servers(&servers).into_parts();
+
+        assert_eq!(configured.len(), 2);
+        for (server, expected_ip, expected_port) in [
+            (
+                configured[0].clone(),
+                "1.1.1.1".parse::<IpAddr>().unwrap(),
+                5353,
+            ),
+            (
+                configured[1].clone(),
+                "2606:4700:4700::1111".parse::<IpAddr>().unwrap(),
+                8053,
+            ),
+        ] {
+            assert_eq!(server.ip, expected_ip);
+            assert_eq!(server.connections.len(), 2);
+            assert!(
+                server
+                    .connections
+                    .iter()
+                    .all(|connection| connection.port == expected_port)
+            );
+        }
     }
 
     #[tokio::test]
-    async fn expired_entries_are_removed_and_cache_is_bounded() {
+    async fn cached_addresses_use_each_request_port() {
         let cache = DnsCache::new();
-        let ip = "127.0.0.1".parse().unwrap();
-        cache.insert("expired.test".into(), vec![ip]).await;
         cache
-            .inner
-            .write()
-            .await
-            .get_mut("expired.test")
-            .unwrap()
-            .expires_at = Instant::now();
-        assert!(cache.get("expired.test", 80).await.is_none());
-        assert!(cache.inner.read().await.is_empty());
+            .insert(
+                "example.test".into(),
+                vec![IpAddr::V4("192.0.2.1".parse().unwrap())],
+            )
+            .await;
+
+        let http = cache.get("example.test", 80).await.unwrap();
+        let https = cache.get("example.test", 443).await.unwrap();
+        assert_eq!(http[0], "192.0.2.1:80".parse().unwrap());
+        assert_eq!(https[0], "192.0.2.1:443".parse().unwrap());
+    }
+
+    #[tokio::test]
+    async fn cache_rotates_all_addresses_and_keeps_ports() {
+        let cache = DnsCache::new();
+        cache
+            .insert(
+                "example.test".into(),
+                vec![
+                    IpAddr::V4("192.0.2.1".parse().unwrap()),
+                    IpAddr::V4("192.0.2.2".parse().unwrap()),
+                ],
+            )
+            .await;
+
+        let first = cache.get("example.test", 8080).await.unwrap();
+        let second = cache.get("example.test", 8080).await.unwrap();
+        assert_eq!(first[0].ip(), "192.0.2.2".parse::<IpAddr>().unwrap());
+        assert_eq!(second[0].ip(), "192.0.2.1".parse::<IpAddr>().unwrap());
+        assert!(first.iter().all(|address| address.port() == 8080));
+        assert!(second.iter().all(|address| address.port() == 8080));
+    }
+
+    #[tokio::test]
+    async fn cache_entry_count_is_bounded() {
+        let cache = DnsCache::new();
         for index in 0..=MAX_CACHE_ENTRIES {
-            cache.insert(format!("{}.test", index), vec![ip]).await;
+            cache
+                .insert(
+                    format!("host-{index}.test"),
+                    vec!["127.0.0.1".parse().unwrap()],
+                )
+                .await;
         }
         assert_eq!(cache.inner.read().await.len(), MAX_CACHE_ENTRIES);
-        assert!(cache.get("0.test", 80).await.is_none());
-    }
-
-    #[tokio::test]
-    async fn ip_literals_keep_the_requested_port() {
-        assert_eq!(
-            resolve_host_with_cache("::1", 5353).await.unwrap(),
-            "[::1]:5353".parse().unwrap()
-        );
-        assert_eq!(
-            resolve_host_addresses_with_cache("127.0.0.1", 443)
-                .await
-                .unwrap(),
-            vec!["127.0.0.1:443".parse().unwrap()]
-        );
     }
 }

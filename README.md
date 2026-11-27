@@ -1,7 +1,7 @@
 # AnyTLS-RS
 
-[![Version](https://img.shields.io/badge/version-custom--v0.5.4.2-blue.svg)](https://github.com/zhu/anytls-rs)
-[![Rust](https://img.shields.io/badge/rust-stable-orange.svg)](https://www.rust-lang.org)
+[![Version](https://img.shields.io/github/v/release/zhu/anytls-rs)](https://github.com/zhu/anytls-rs/releases)
+[![Rust](https://img.shields.io/badge/rust-1.91+-orange.svg)](https://www.rust-lang.org)
 [![Edition](https://img.shields.io/badge/edition-2024-blue.svg)](https://doc.rust-lang.org/edition-guide/)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
@@ -12,6 +12,10 @@ AnyTLS 协议的异步 Rust 实现，包含客户端和服务端。这个 fork �
 ---
 
 > **Custom 服务端版本：`custom-v0.5.4.2`**（二进制版本 `0.5.4-custom.2`）。本版本针对 Rust 服务端与 dae / AnyTLS 参考客户端的互通修复；Shadowrocket 尚未进行 iOS 实机验证。部署限制、测试范围与固定客户端源码见[服务端兼容性说明](docs/SERVER_COMPATIBILITY.md)，下载见 [Releases](https://github.com/zhu/anytls-rs/releases/tag/custom-v0.5.4.2)。
+
+## 上游同步
+
+此仓库的 `main` 维护定制版，`upstream/main` 跟踪原版。同步一个上游版本时，从 `main` 创建临时 `sync/upstream-vX.Y.Z` 分支，并合并对应的上游提交。运行 Rust 测试、依赖审计以及 dae 和 anytls-go 互通测试后，将 `main` 快进到已验证的合并提交，以保留双方历史。定制发布使用 `custom-vX.Y.Z.N` 标签。
 
 ## ✨ 核心特性
 
@@ -39,7 +43,7 @@ AnyTLS 协议的异步 Rust 实现，包含客户端和服务端。这个 fork �
 
 ### 1. 环境要求
 
-- Rust stable / cargo（推荐使用 rustup）
+- Rust 1.91+ / Cargo（推荐使用 rustup）
 - 可选：`openssl`（如需导入现有证书）
 - macOS/Linux 需允许脚本执行权限：`chmod +x scripts/*.sh`
 
