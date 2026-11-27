@@ -2,7 +2,7 @@
 
 All notable changes to this project will be documented in this file. Dates use `YYYY-MM-DD`.
 
-## [Unreleased] — custom build based on 0.5.7
+## [custom-v0.5.7.1] - 2026-11-27
 
 - Building the fork requires Rust 1.91 or newer for the locked file-watcher dependencies.
 - Settings, Alert and SynAck payloads have a 4 KiB limit. The fork accepts Waste, UpdatePaddingScheme and ServerSettings up to the 65,535-byte wire limit. Keep these payloads within 4 KiB when communicating with unmodified upstream 0.5.7 peers.

@@ -11,7 +11,7 @@ An asynchronous Rust implementation of AnyTLS, including a client and server. Th
 
 ---
 
-> **Custom server release: `custom-v0.5.4.2`** (binary version `0.5.4-custom.2`). This release fixes Rust server interoperability with dae and the AnyTLS reference client. Shadowrocket has not been tested on an iOS device. See [server compatibility notes](docs/SERVER_COMPATIBILITY.md) for limits and pinned test clients, and [Releases](https://github.com/zhu/anytls-rs/releases/tag/custom-v0.5.4.2) for downloads.
+> **`custom-v0.5.7.1`** is based on upstream 0.5.7 and reports binary version `0.5.7-custom.1`. The Rust server passed interoperability tests with dae and anytls-go clients. See the [release notes](docs/RELEASE_NOTES_custom-v0.5.7.1.md) for test coverage and [GitHub Releases](https://github.com/zhu/anytls-rs/releases/tag/custom-v0.5.7.1) for downloads.
 
 ## Keeping the fork in sync
 

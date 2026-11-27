@@ -11,7 +11,7 @@ AnyTLS 协议的异步 Rust 实现，包含客户端和服务端。这个 fork �
 
 ---
 
-> **Custom 服务端版本：`custom-v0.5.4.2`**（二进制版本 `0.5.4-custom.2`）。本版本针对 Rust 服务端与 dae / AnyTLS 参考客户端的互通修复；Shadowrocket 尚未进行 iOS 实机验证。部署限制、测试范围与固定客户端源码见[服务端兼容性说明](docs/SERVER_COMPATIBILITY.md)，下载见 [Releases](https://github.com/zhu/anytls-rs/releases/tag/custom-v0.5.4.2)。
+> **`custom-v0.5.7.1`** 基于上游 0.5.7，二进制版本为 `0.5.7-custom.1`。Rust 服务端已通过 dae 和 anytls-go 客户端的互通测试。测试范围见[发布说明](docs/RELEASE_NOTES_custom-v0.5.7.1.md)，下载见 [GitHub Releases](https://github.com/zhu/anytls-rs/releases/tag/custom-v0.5.7.1)。
 
 ## 上游同步
 
